@@ -87,7 +87,8 @@ def get_tile_bounds(pos: int, W: int, H: int) -> tuple[int, int, int, int]:
         return (int(0.015 * W), y1, margin_x_left, y2)
     raise ValueError(f"Invalid position {pos}")
 
-def render_board_image(game) -> io.BytesIO:
+def render_board_base(game) -> Image.Image:
+    """Renders the static board template with owner colors, banners, prices, and properties."""
     if os.path.exists(TEMPLATE_PATH):
         base_img = Image.open(TEMPLATE_PATH).convert("RGBA")
     else:
@@ -96,15 +97,13 @@ def render_board_image(game) -> io.BytesIO:
 
     W, H = base_img.size
 
-    # Create overlay layer for translucent glows and clean text
+    # Create overlay layer for translucent glows, owner banners, and clean text
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    font_header = get_font(max(12, int(W * 0.013)), bold=True)
-    font_body = get_font(max(10, int(W * 0.011)), bold=False)
     font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
 
-    # 1. Overlay Dynamic Property Text, Owner Badges & Mortgaged Status
+    # 1. Overlay Dynamic Property Text, Owner Badges, Recolor Banners & Mortgaged Status
     for pos in range(40):
         x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
         tile = game.board[pos]
@@ -113,49 +112,63 @@ def render_board_image(game) -> io.BytesIO:
         tile_w = x2 - x1
         tile_h = y2 - y1
 
-        # Determine inner text slot zone for each tile side so we don't cover color bars
+        # Determine inner text slot zone and banner rectangle for each tile side
         pad = 2
+        banner_rect = None
         if 1 <= pos <= 9:
-            # Top row: color bar at BOTTOM, slot fills top 75%
+            # Top row: color bar at BOTTOM
             cx1 = x1 + pad
             cy1 = y1 + pad
             cx2 = x2 - pad
-            cy2 = y2 - int(tile_h * 0.28)  # leave space for bottom color bar
+            cy2 = y2 - int(tile_h * 0.28)
+            banner_rect = (x1 + 1, cy2, x2 - 1, y2 - 1)
         elif 11 <= pos <= 19:
-            # Right column: color bar on LEFT, slot fills right 75%
-            cx1 = x1 + int(tile_w * 0.28)  # leave space for left color bar
+            # Right column: color bar on LEFT
+            cx1 = x1 + int(tile_w * 0.28)
             cy1 = y1 + pad
             cx2 = x2 - pad
             cy2 = y2 - pad
+            banner_rect = (x1 + 1, y1 + 1, cx1, y2 - 1)
         elif 21 <= pos <= 29:
-            # Bottom row: color bar at TOP (closest to center), slot fills bottom 75%
+            # Bottom row: color bar at TOP (closest to center)
             cx1 = x1 + pad
-            cy1 = y1 + int(tile_h * 0.28)  # leave space for top color bar
+            cy1 = y1 + int(tile_h * 0.28)
             cx2 = x2 - pad
             cy2 = y2 - pad
+            banner_rect = (x1 + 1, y1 + 1, x2 - 1, cy1)
         elif 31 <= pos <= 39:
-            # Left column: color bar on RIGHT, slot fills left 75%
+            # Left column: color bar on RIGHT
             cx1 = x1 + pad
             cy1 = y1 + pad
-            cx2 = x2 - int(tile_w * 0.28)  # leave space for right color bar
+            cx2 = x2 - int(tile_w * 0.28)
             cy2 = y2 - pad
+            banner_rect = (cx2, y1 + 1, x2 - 1, y2 - 1)
         else:
             cx1, cy1, cx2, cy2 = x1, y1, x2, y2
 
-        # Draw Owner Glow Border & Badge if property is owned
+        # Color tiles by owner: recolor banner and background when owned
         if pos in game.properties_owned:
             owner_id = game.properties_owned[pos]
             owner_idx = next((i for i, p in enumerate(game.player_list) if p.id == owner_id), 0)
             scheme = PLAYER_NEON_SCHEMES[owner_idx % len(PLAYER_NEON_SCHEMES)]
             r, g, b = scheme["rgb"]
 
-            # Glowing owner border outline around tile frame
+            # 1. Recolor banner / header with owner's neon color
+            if banner_rect and tile_type == "property":
+                bx1, by1, bx2, by2 = banner_rect
+                draw.rectangle([bx1, by1, bx2, by2], fill=(r, g, b, 235))
+                draw.rectangle([bx1, by1, bx2, by2], outline=(255, 255, 255, 180), width=1)
+
+            # 2. Recolor inner tile card background with glowing owner tint
+            draw.rectangle([cx1, cy1, cx2, cy2], fill=(r, g, b, 50))
+
+            # 3. Glowing owner border outline around tile frame
             draw.rectangle([cx1 - 1, cy1 - 1, cx2 + 1, cy2 + 1], outline=(r, g, b, 120), width=3)
             draw.rectangle([cx1, cy1, cx2, cy2], outline=(r, g, b, 255), width=2)
 
-            # Owner Badge (P1, P2...) in top-left of text slot
+            # 4. Owner Badge (P1, P2...) in top-left of text slot
             badge_font = get_font(max(8, int(min(tile_w, tile_h) * 0.14)), bold=True)
-            draw.rectangle([cx1 + 2, cy1 + 2, cx1 + 18, cy1 + 12], fill=(r, g, b, 230))
+            draw.rectangle([cx1 + 2, cy1 + 2, cx1 + 18, cy1 + 12], fill=(r, g, b, 240))
             draw.text((cx1 + 10, cy1 + 7), scheme["label"], fill=(0, 0, 0, 255), font=badge_font, anchor="mm")
 
         # Overlay text & elements directly onto template (NO opaque box fill)
@@ -226,18 +239,18 @@ def render_board_image(game) -> io.BytesIO:
 
                 ty1 = center_y - total_h // 2 + line_gap // 2
 
-                # Text with subtle drop shadow for high contrast on dark template
-                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 220), font=tile_font, anchor="mm")
+                # Text with drop shadow for high contrast
+                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                 draw.text((text_x, ty1), clean_label, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
 
                 if clean_label2:
-                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 220), font=tile_font, anchor="mm")
+                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                     draw.text((text_x, ty1 + line_gap), clean_label2, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
 
                 # Price at bottom of tile slot if unowned
                 if pos not in game.properties_owned:
                     price = tile.get("price", 0)
-                    draw.text((text_x + 1, cy2 - base_size // 2 - 1), f"${price}", fill=(0, 0, 0, 220), font=price_font, anchor="mm")
+                    draw.text((text_x + 1, cy2 - base_size // 2 - 1), f"${price}", fill=(0, 0, 0, 240), font=price_font, anchor="mm")
                     draw.text((text_x, cy2 - base_size // 2 - 2), f"${price}", fill=(0, 240, 255, 255), font=price_font, anchor="mm")
 
             else:
@@ -247,11 +260,11 @@ def render_board_image(game) -> io.BytesIO:
                 center_y = (cy1 + cy2) // 2 - 4
                 ty1 = center_y - total_h // 2 + line_gap // 2
 
-                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 220), font=tile_font, anchor="mm")
+                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                 draw.text((text_x, ty1), clean_label, fill=(255, 235, 170, 255), font=tile_font, anchor="mm")
 
                 if clean_label2:
-                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 220), font=tile_font, anchor="mm")
+                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                     draw.text((text_x, ty1 + line_gap), clean_label2, fill=(255, 235, 170, 255), font=tile_font, anchor="mm")
 
                 if tile_type in ("railroad", "utility") and pos not in game.properties_owned:
@@ -275,12 +288,23 @@ def render_board_image(game) -> io.BytesIO:
                 draw.rectangle([cx2 - hw - 2, cy1 + 2, cx2 - 2, cy1 + hh + 2], fill=(0, 220, 130, 240))
                 draw.text((cx2 - hw // 2 - 2, cy1 + hh // 2 + 2), h_text, fill=(0, 0, 0, 255), font=font_tiny, anchor="mm")
 
-    # 2. Draw Multi-Layer Glowing Neon Player Piece Locators
+    return Image.alpha_composite(base_img, overlay)
+
+def draw_player_tokens_on_image(base_img: Image.Image, game, positions_override: dict[int, int] | None = None) -> Image.Image:
+    """Draws multi-layer glowing player tokens on the pre-rendered board image."""
+    W, H = base_img.size
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
+
     pos_players: dict[int, list[int]] = {}
     for idx, player in enumerate(game.player_list):
         state = game.get_player_state(player.id)
         if not state.get("bankrupt", False):
-            p = state["position"]
+            if positions_override and player.id in positions_override:
+                p = positions_override[player.id]
+            else:
+                p = state["position"]
             pos_players.setdefault(p, []).append(idx)
 
     for pos, player_indices in pos_players.items():
@@ -316,10 +340,57 @@ def render_board_image(game) -> io.BytesIO:
             # Layer 5: Centered Player Label
             draw.text((tx, ty), scheme["label"], fill=(255, 255, 255, 255), font=font_tiny, anchor="mm")
 
-    # Combine Base Image and Overlay
-    final_img = Image.alpha_composite(base_img, overlay).convert("RGB")
+    return Image.alpha_composite(base_img, overlay).convert("RGB")
+
+def render_board_image(game, positions_override: dict[int, int] | None = None) -> io.BytesIO:
+    """Renders a static single PNG frame of the board."""
+    base_img = render_board_base(game)
+    final_img = draw_player_tokens_on_image(base_img, game, positions_override)
 
     buf = io.BytesIO()
-    final_img.save(buf, format="PNG")
+    final_img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+def render_board_movement_animation(game, moving_player_id: int, start_pos: int, end_pos: int) -> io.BytesIO:
+    """
+    Renders an animated GIF showing the token sliding tile-by-tile from start_pos to end_pos.
+    Intermediate frames have short durations and the final frame pauses.
+    """
+    # Calculate stepping path along the 40-tile perimeter track
+    if start_pos == end_pos:
+        path = [start_pos]
+    elif end_pos > start_pos:
+        path = list(range(start_pos, end_pos + 1))
+    else:
+        # Wrapped around GO
+        path = list(range(start_pos, 40)) + list(range(0, end_pos + 1))
+
+    if len(path) <= 1:
+        return render_board_image(game)
+
+    base_img = render_board_base(game)
+    frames = []
+
+    for step_pos in path:
+        frame_img = draw_player_tokens_on_image(base_img, game, {moving_player_id: step_pos})
+        # Resize slightly to keep animated GIF compact & super snappy in Discord chat
+        frame_img = frame_img.resize((960, 768), Image.Resampling.BILINEAR)
+        # Convert to P mode with adaptive palette for crisp GIF color compression
+        frames.append(frame_img.convert("P", palette=Image.Palette.ADAPTIVE))
+
+    # Intermediate steps ~190ms, resting frame ~1300ms
+    durations = [190] * (len(frames) - 1) + [1300]
+
+    buf = io.BytesIO()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True
+    )
     buf.seek(0)
     return buf

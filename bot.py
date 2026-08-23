@@ -1,11 +1,12 @@
 import os
+import re
 import time
 import asyncio
 import discord
 from aiohttp import web
 from discord.ext import commands
 from game import MonopolyGame, generate_random_country_board
-from board_renderer import render_board_image
+from board_renderer import render_board_image, render_board_movement_animation
 from trade_view import TradeProposalView
 from stats_db import (
     get_player_stats, record_game_win, claim_daily,
@@ -28,36 +29,107 @@ COLOR_LABELS = {
     "dark_blue": "💙",
 }
 
-def build_board_embed(game: MonopolyGame) -> discord.Embed:
-    """Builds a sleek Discord embed showing player scorecard and game state alongside the 2D board image."""
-    player_list = game.player_list
+async def cleanup_turn_messages(game, channel):
+    """Auto-deletes messages from 2 or more full turns ago."""
+    if not channel or not hasattr(game, "turn_message_history"):
+        return
+    remaining_history = []
+    for entry in game.turn_message_history:
+        # Auto-delete after 2 full turns complete
+        if game.turn_count - entry["turn"] >= 2:
+            for msg in entry["messages"]:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+        else:
+            remaining_history.append(entry)
+    game.turn_message_history = remaining_history
 
-    scorecard_lines = []
-    for i, player in enumerate(player_list):
-        state = game.get_player_state(player.id)
-        st = get_player_stats(player.id, player.display_name)
-        token = st.get("custom_token") or PLAYER_TOKENS[i % len(PLAYER_TOKENS)]
-        jail_tag = " 🔒 In Jail" if state["in_jail"] else ""
-        bankrupt_tag = " 💥 BANKRUPT" if state.get("bankrupt", False) else ""
-        props = len(state["properties"])
-        tile_name = game.board[state["position"]]["name"]
-        scorecard_lines.append(
-            f"{token} **{player.display_name}** — 💰 ${state['money']} | 🏠 {props} props{jail_tag}{bankrupt_tag}\n"
-            f" └ 📍 Currently on: **{tile_name}**"
-        )
+def format_scorecard_lines(game) -> str:
+    """Formats player cash and property balances in clean plain text."""
+    lines = []
+    for i, p in enumerate(game.player_list):
+        st = game.get_player_state(p.id)
+        stat = get_player_stats(p.id, p.display_name)
+        token = stat.get("custom_token") or PLAYER_TOKENS[i % len(PLAYER_TOKENS)]
+        jail_tag = " [🔒 In Border Control]" if st["in_jail"] else ""
+        bankrupt_tag = " [💥 BANKRUPT]" if st.get("bankrupt", False) else ""
+        prop_cnt = len(st["properties"])
+        lines.append(f"{token} **{p.display_name}**: 💰 ${st['money']} | 🏠 {prop_cnt} props{jail_tag}{bankrupt_tag}")
+    return "\n".join(lines)
 
-    embed = discord.Embed(
-        title="🌍 Mutseri's World Monopoly — Live Board",
-        color=discord.Color.dark_gold()
-    )
-    embed.add_field(name="📊 Player Scorecard", value="\n".join(scorecard_lines), inline=False)
+def parse_trade_args(game, sender_id: int, target_id: int, raw_args: str) -> tuple[list[int], int, list[int], int, str | None]:
+    """
+    Parses arbitrary combinations of properties and cash for trade proposals.
+    Supports:
+      - '100 50'
+      - 'Tokyo for London'
+      - 'Tokyo 100 for London 50'
+      - 'offer: Tokyo, 100 req: London, 50'
+      - 'Tokyo, New York to London, 100'
+    """
+    if not raw_args.strip():
+        return [], 0, [], 0, "Please specify what you are offering and requesting. Example: `!trade @user Tokyo $100 for London $50`"
 
-    recent_log = game.log[-3:] if game.log else ["Game started! Roll the dice."]
-    embed.add_field(name="📜 Recent Events", value="\n".join(recent_log), inline=False)
+    text = raw_args.strip()
 
-    current = game.get_current_player()
-    embed.set_footer(text=f"🎲 Current Turn: {current.display_name} (⏱️ 90s limit)")
-    return embed
+    # Split into offered vs requested using standard keywords
+    split_match = re.search(r'(\bfor\b|\bto\b|\breq:\s*|\brequest:\s*|\brequesting:\s*|\bwants?:\s*|\bwant\b|\bwants\b)', text, re.IGNORECASE)
+    if split_match:
+        offer_str = text[:split_match.start()].strip()
+        req_str = text[split_match.end():].strip()
+    else:
+        parts = text.split()
+        if len(parts) == 2:
+            offer_str = parts[0]
+            req_str = parts[1]
+        else:
+            return [], 0, [], 0, "Could not separate offer and request. Use `for` (e.g. `!trade @user [offer] for [request]`)."
+
+    offer_str = re.sub(r'^(offer|offering|give|giving):\s*', '', offer_str, flags=re.IGNORECASE).strip()
+    req_str = re.sub(r'^(req|request|requesting|want|wants):\s*', '', req_str, flags=re.IGNORECASE).strip()
+
+    def parse_side(side_str: str, player_id: int):
+        cash = 0
+        props = []
+        tokens = [t.strip() for t in re.split(r'[,;]+|\s+', side_str) if t.strip()]
+        unmatched_words = []
+
+        for tok in tokens:
+            num_clean = tok.replace('$', '').replace(',', '')
+            if num_clean.isdigit():
+                cash += int(num_clean)
+            else:
+                unmatched_words.append(tok)
+
+        if unmatched_words:
+            full_phrase = " ".join(unmatched_words)
+            pos = game.find_property_by_name(full_phrase, player_id)
+            if pos is not None:
+                props.append(pos)
+            else:
+                for word in unmatched_words:
+                    p = game.find_property_by_name(word, player_id)
+                    if p is not None and p not in props:
+                        props.append(p)
+                    elif p is None:
+                        return None, None, f"Property `{word}` not found or not owned by <@{player_id}>!"
+
+        return props, cash, None
+
+    offer_props, offer_cash, err1 = parse_side(offer_str, sender_id)
+    if err1:
+        return [], 0, [], 0, err1
+
+    req_props, req_cash, err2 = parse_side(req_str, target_id)
+    if err2:
+        return [], 0, [], 0, err2
+
+    if not offer_props and offer_cash == 0 and not req_props and req_cash == 0:
+        return [], 0, [], 0, "A trade proposal must include at least one cash amount or property!"
+
+    return offer_props, offer_cash, req_props, req_cash, None
 
 
 class TurnView(discord.ui.View):
@@ -67,7 +139,7 @@ class TurnView(discord.ui.View):
         self.game.current_view = self
         self.channel_id = channel_id
         self.timer_task = None
-        self.message: discord.Message | None = None  # stored after the first send
+        self.message: discord.Message | None = None
         self.setup_buttons()
         self.reset_timer()
 
@@ -101,26 +173,23 @@ class TurnView(discord.ui.View):
             self.game.next_turn()
 
             next_p = self.game.get_current_player()
-            embed = discord.Embed(
-                title="⏱️ Turn Time Limit Expired (90s)",
-                description=f"**{current_player.display_name}** took too long! Turn automatically passed to **{next_p.display_name}**.",
-                color=discord.Color.orange()
-            )
-            self.setup_buttons()
+            channel = bot.get_channel(self.channel_id)
+            if not channel:
+                return
+
             buf = render_board_image(self.game)
-            file = discord.File(buf, filename="monopoly_board.png")
-            embed.set_image(url="attachment://monopoly_board.png")
-            if self.message:
-                try:
-                    await self.message.edit(embed=embed, view=self, attachments=[file])
-                except Exception:
-                    channel = bot.get_channel(self.channel_id)
-                    if channel:
-                        self.message = await channel.send(embed=embed, view=self, file=file)
-            else:
-                channel = bot.get_channel(self.channel_id)
-                if channel:
-                    self.message = await channel.send(embed=embed, view=self, file=file)
+            visual_file = discord.File(buf, filename="monopoly_board.png")
+            deadline_ts = int(time.time()) + 90
+
+            action_text = (
+                f"⏱️ **Turn Timer Expired (90s)**\n"
+                f"**{current_player.display_name}** took too long! Turn automatically passed to **{next_p.mention}**."
+            )
+            financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(self.game)}"
+            status_text = f"⏳ **Turn Status:** It is now **{next_p.display_name}**'s turn! (⏱️ Expires <t:{deadline_ts}:R>)"
+
+            self.setup_buttons()
+            await self.send_turn_bundle(channel, visual_file, action_text, financial_text, status_text)
             self.reset_timer()
         except asyncio.CancelledError:
             pass
@@ -194,13 +263,17 @@ class TurnView(discord.ui.View):
         board_btn.callback = self.board_callback
         self.add_item(board_btn)
 
-    async def update_turn_message(self, interaction: discord.Interaction, embed: discord.Embed):
-        self.reset_timer()
-        self.setup_buttons()
-        buf = render_board_image(self.game)
-        file = discord.File(buf, filename="monopoly_board.png")
-        embed.set_image(url="attachment://monopoly_board.png")
-        await interaction.response.edit_message(embed=embed, view=self, attachments=[file])
+    async def send_turn_bundle(self, channel: discord.TextChannel, visual_file: discord.File, action_text: str, financial_text: str, status_text: str):
+        """Sends the 3 grouped plain-text turn messages with the board image/GIF and handles 2-turn auto-cleanup."""
+        msg1 = await channel.send(content=action_text, file=visual_file)
+        msg2 = await channel.send(content=financial_text)
+        msg3 = await channel.send(content=status_text, view=self)
+        self.message = msg3
+        self.game.turn_message_history.append({
+            "turn": self.game.turn_count,
+            "messages": [msg1, msg2, msg3]
+        })
+        await cleanup_turn_messages(self.game, channel)
 
     async def roll_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -208,22 +281,36 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        await interaction.response.defer()
         d1, d2 = self.game.roll_dice()
         total = d1 + d2
-        self.game.log_event(f"{current_player.display_name} rolled {d1} and {d2} (Total: {total})")
-        self.game.move_player(current_player.id, total)
+        old_pos, new_pos = self.game.move_player(current_player.id, total)
 
         player_state = self.game.get_player_state(current_player.id)
         player_state["has_rolled"] = True
-        current_tile = self.game.board[player_state["position"]]
+        current_tile = self.game.board[new_pos]
 
-        embed = discord.Embed(
-            title=f"🎲 {current_player.display_name} Rolled {total}!",
-            description=f"Landed on **{current_tile['name']}**.\n\n" + "\n".join(self.game.log[-3:]),
-            color=discord.Color.blue()
+        # Piece movement animated GIF
+        anim_buf = render_board_movement_animation(self.game, current_player.id, old_pos, new_pos)
+        visual_file = discord.File(anim_buf, filename="monopoly_move.gif")
+
+        deadline_ts = int(time.time()) + 90
+        recent_log = self.game.log[-2:] if len(self.game.log) >= 2 else self.game.log[-1:]
+
+        action_text = (
+            f"🎲 **{current_player.display_name}** rolled **[{d1}, {d2}] (Total: {total})**!\n"
+            f"📍 Landed on **{current_tile['name']}**.\n"
+            f"📜 " + " | ".join(recent_log)
         )
-        embed.add_field(name="Balance", value=f"${player_state['money']}")
-        await self.update_turn_message(interaction, embed)
+        financial_text = (
+            f"💰 **Financial Summary:** Balance: **${player_state['money']}** "
+            f"(Net Worth: **${self.game.get_player_net_worth(current_player.id)}** | Properties: **{len(player_state['properties'])}**)"
+        )
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn — Choose an action below (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def buy_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -233,19 +320,26 @@ class TurnView(discord.ui.View):
 
         player_state = self.game.get_player_state(current_player.id)
         pos = player_state["position"]
-        success = self.game.buy_property(current_player.id, pos)
+        tile = self.game.board[pos]
 
-        if success:
-            current_tile = self.game.board[pos]
-            embed = discord.Embed(
-                title="🏠 Property Purchased!",
-                description=f"Bought **{current_tile['name']}**.\n\n" + "\n".join(self.game.log[-3:]),
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Balance", value=f"${player_state['money']}")
-            await self.update_turn_message(interaction, embed)
-        else:
-            await interaction.response.send_message("You don't have enough money!", ephemeral=True)
+        if player_state["money"] < tile["price"]:
+            await interaction.response.send_message(f"You don't have enough money to buy {tile['name']} (${tile['price']})!", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        self.game.buy_property(current_player.id, pos)
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = f"🏠 **Property Purchased!** **{current_player.display_name}** bought **{tile['name']}** for **${tile['price']}**!"
+        financial_text = f"💰 **Financial Summary:** Spent **${tile['price']}** | Cash Remaining: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def build_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -254,24 +348,32 @@ class TurnView(discord.ui.View):
             return
 
         player_state = self.game.get_player_state(current_player.id)
-        buildable = [p for p in player_state["properties"] if self.game.has_monopoly(current_player.id, self.game.board[p]["color"]) and self.game.board[p]["houses"] < 5]
+        buildable = [p for p in player_state["properties"] if self.game.has_monopoly(current_player.id, self.game.board[p].get("color", "")) and self.game.board[p]["houses"] < 5]
 
         if not buildable:
             await interaction.response.send_message("You don't have any complete monopoly properties to build on!", ephemeral=True)
             return
 
         pos = buildable[0]
-        success = self.game.build_house(current_player.id, pos)
-        if success:
-            tile = self.game.board[pos]
-            embed = discord.Embed(
-                title="🏗️ House Constructed!",
-                description=f"Built on **{tile['name']}**!\n\n" + "\n".join(self.game.log[-2:]),
-                color=discord.Color.green()
-            )
-            await self.update_turn_message(interaction, embed)
-        else:
-            await interaction.response.send_message("Not enough cash to build!", ephemeral=True)
+        tile = self.game.board[pos]
+        if player_state["money"] < tile["house_price"]:
+            await interaction.response.send_message(f"Not enough cash to build on {tile['name']} (${tile['house_price']})!", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        self.game.build_house(current_player.id, pos)
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = f"🏗️ **Construction Complete!** Built house/skyscraper on **{tile['name']}** for **${tile['house_price']}**!"
+        financial_text = f"💰 **Financial Summary:** Spent **${tile['house_price']}** | Cash Remaining: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def mortgage_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -285,15 +387,22 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("You have no eligible properties to mortgage!", ephemeral=True)
             return
 
+        await interaction.response.defer()
         pos = unmortgaged[0]
         self.game.mortgage_property(current_player.id, pos)
         tile = self.game.board[pos]
-        embed = discord.Embed(
-            title="🏦 Property Mortgaged",
-            description=f"Mortgaged **{tile['name']}** for cash!\n\n" + "\n".join(self.game.log[-2:]),
-            color=discord.Color.gold()
-        )
-        await self.update_turn_message(interaction, embed)
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = f"🏦 **Property Mortgaged:** Mortgaged **{tile['name']}** and received **${tile['price'] // 2}**!"
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def unmortgage_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -309,20 +418,25 @@ class TurnView(discord.ui.View):
 
         pos = mortgaged[0]
         tile = self.game.board[pos]
-        cost = int((tile["price"] // 2) * 1.1)
+        cost = int((tile["price"] // 2) * 1.10)
         if player_state["money"] < cost:
             await interaction.response.send_message(f"You need ${cost} to unmortgage {tile['name']}!", ephemeral=True)
             return
 
-        if self.game.unmortgage_property(current_player.id, pos):
-            embed = discord.Embed(
-                title="🔓 Property Unmortgaged",
-                description=f"Unmortgaged **{tile['name']}** for ${cost}!\n\n" + "\n".join(self.game.log[-2:]),
-                color=discord.Color.green()
-            )
-            await self.update_turn_message(interaction, embed)
-        else:
-            await interaction.response.send_message("Failed to unmortgage property.", ephemeral=True)
+        await interaction.response.defer()
+        self.game.unmortgage_property(current_player.id, pos)
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = f"🔓 **Property Unmortgaged:** Unmortgaged **{tile['name']}** for **${cost}**!"
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def sell_house_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -336,15 +450,22 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("You have no houses to sell!", ephemeral=True)
             return
 
+        await interaction.response.defer()
         pos = houses[0]
         self.game.sell_house(current_player.id, pos)
         tile = self.game.board[pos]
-        embed = discord.Embed(
-            title="🏷️ House Sold",
-            description=f"Sold house on **{tile['name']}** for 50% value.\n\n" + "\n".join(self.game.log[-2:]),
-            color=discord.Color.gold()
-        )
-        await self.update_turn_message(interaction, embed)
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = f"🏷️ **House Sold:** Sold house on **{tile['name']}** for **${tile['house_price'] // 2}**."
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def bail_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -352,12 +473,22 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
-        success = self.game.pay_jail_bail(current_player.id)
-        if success:
-            embed = discord.Embed(title="💳 Bail Paid!", description="Escaped Border Control! You can now roll.", color=discord.Color.green())
-            await self.update_turn_message(interaction, embed)
-        else:
+        if not self.game.pay_jail_bail(current_player.id):
             await interaction.response.send_message("You need $50 to pay bail!", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = "💳 **Bail Paid:** Escaped Border Control! You are now free to roll."
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${self.game.players[current_player.id]['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def doubles_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -365,13 +496,26 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        await interaction.response.defer()
         d1, d2, escaped = self.game.attempt_jail_doubles(current_player.id)
-        embed = discord.Embed(
-            title=f"🎲 Rolled {d1} and {d2}!",
-            description="Escaped Border Control!" if escaped else "No doubles! Remain in Border Control.",
-            color=discord.Color.green() if escaped else discord.Color.red()
-        )
-        await self.update_turn_message(interaction, embed)
+        deadline_ts = int(time.time()) + 90
+
+        if escaped:
+            buf = render_board_movement_animation(self.game, current_player.id, 10, self.game.players[current_player.id]["position"])
+            visual_file = discord.File(buf, filename="monopoly_move.gif")
+            action_text = f"🎲 **DOUBLES ROLLED [{d1}, {d2}]!** Escaped Border Control and moved forward!"
+        else:
+            buf = render_board_image(self.game)
+            visual_file = discord.File(buf, filename="monopoly_board.png")
+            action_text = f"🎲 Rolled **[{d1}, {d2}]** (No doubles). Remain held in Border Control."
+
+        player_state = self.game.get_player_state(current_player.id)
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def jail_card_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -379,10 +523,20 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
-        success = self.game.use_jail_card(current_player.id)
-        if success:
-            embed = discord.Embed(title="🎟️ Pass Used!", description="Diplomatic Immunity used! You are free.", color=discord.Color.gold())
-            await self.update_turn_message(interaction, embed)
+        await interaction.response.defer()
+        self.game.use_jail_card(current_player.id)
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+        deadline_ts = int(time.time()) + 90
+
+        action_text = "🎟️ **Diplomatic Pass Used:** Diplomatic immunity granted! You are now free to roll."
+        player_state = self.game.get_player_state(current_player.id)
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def bankruptcy_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -390,30 +544,35 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        await interaction.response.defer()
         self.game.declare_bankruptcy(current_player.id)
         active_players = [p for p in self.game.player_list if not self.game.players[p.id]["bankrupt"]]
-        
+
         if len(active_players) == 1:
             winner = active_players[0]
             record_game_win(winner.id, [p.id for p in self.game.player_list])
-            embed = discord.Embed(
-                title="🏆 GAME OVER — VICTORY!",
-                description=f"🎉 **{winner.display_name}** is the sole surviving Monopoly Tycoon and wins the game!",
-                color=discord.Color.gold()
-            )
-            await interaction.response.edit_message(embed=embed, view=None)
             if self.channel_id in active_games:
                 del active_games[self.channel_id]
+            self.stop()
+            await interaction.channel.send(
+                f"🏆 **GAME OVER — VICTORY!**\n🎉 **{winner.mention}** is the sole surviving Monopoly Tycoon and wins the game!"
+            )
             return
 
         self.game.next_turn()
         next_player = self.game.get_current_player()
-        embed = discord.Embed(
-            title="💥 Bankruptcy Declared!",
-            description=f"**{current_player.display_name}** has surrendered all assets and was eliminated!\n\nIt is now {next_player.display_name}'s turn.",
-            color=discord.Color.red()
-        )
-        await self.update_turn_message(interaction, embed)
+        deadline_ts = int(time.time()) + 90
+
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+
+        action_text = f"💥 **Bankruptcy Declared:** **{current_player.display_name}** has surrendered all assets and was eliminated!"
+        financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(self.game)}"
+        status_text = f"⏳ **Turn Status:** It is now **{next_player.display_name}**'s turn! (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def end_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -426,55 +585,38 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("⚠️ You have a negative cash balance! Mortgage properties, sell houses, trade, or declare bankruptcy before ending your turn.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         self.game.next_turn()
         next_player = self.game.get_current_player()
-
-        scorecard_lines = []
-        for i, player in enumerate(self.game.player_list):
-            state = self.game.get_player_state(player.id)
-            st = get_player_stats(player.id, player.display_name)
-            token = st.get("custom_token") or PLAYER_TOKENS[i % len(PLAYER_TOKENS)]
-            tile_name = self.game.board[state["position"]]["name"]
-            jail_tag = " 🔒" if state["in_jail"] else ""
-            bankrupt_tag = " 💥" if state.get("bankrupt", False) else ""
-            is_current = " ← **Your turn!**" if player.id == next_player.id else ""
-            scorecard_lines.append(
-                f"{token} **{player.display_name}**{jail_tag}{bankrupt_tag} — 💰 ${state['money']}\n"
-                f"　　📍 {tile_name}{is_current}"
-            )
-
-        embed = discord.Embed(
-            title=f"🎲 {next_player.display_name}'s Turn!",
-            description="\n\n".join(scorecard_lines),
-            color=discord.Color.green()
-        )
-        await self.update_turn_message(interaction, embed)
-
-        # Ping the next player in channel with a live 90s Discord countdown timer
         deadline_ts = int(time.time()) + 90
-        channel = bot.get_channel(self.channel_id)
-        if channel:
-            await channel.send(
-                f"🎲 {next_player.mention} — **It's your turn!** Roll the dice before the timer runs out!\n"
-                f"⏱️ Turn expires: <t:{deadline_ts}:R>"
-            )
 
+        buf = render_board_image(self.game)
+        visual_file = discord.File(buf, filename="monopoly_board.png")
+
+        action_text = (
+            f"⏩ **Turn Ended:** **{current_player.display_name}** finished their turn.\n"
+            f"🎲 **It is now {next_player.mention}'s turn!**"
+        )
+        financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(self.game)}"
+        status_text = f"⏳ **Turn Status:** **{next_player.display_name}**'s turn — Roll the dice! (⏱️ Expires <t:{deadline_ts}:R>)"
+
+        self.setup_buttons()
+        self.reset_timer()
+        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def board_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         buf = render_board_image(self.game)
         file = discord.File(buf, filename="monopoly_board.png")
-        embed = build_board_embed(self.game)
-        embed.set_image(url="attachment://monopoly_board.png")
-        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+        await interaction.followup.send(content="📋 **Current Monopoly Board State:**", file=file, ephemeral=True)
 
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="ms!", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("ms!", "!"), intents=intents, help_command=None)
 
-active_games = {} 
+active_games = {}
 
 @bot.event
 async def on_ready():
@@ -491,7 +633,7 @@ async def start_monopoly(ctx, *opponents: discord.Member):
         return
 
     if not opponents:
-        await ctx.send("Please mention 1 to 3 opponents to play! Example: `ms!sm @User1 @User2`")
+        await ctx.send("Please mention 1 to 3 opponents to play! Example: `!sm @User1 @User2`")
         return
 
     if any(opp.bot for opp in opponents):
@@ -527,75 +669,239 @@ async def start_monopoly(ctx, *opponents: discord.Member):
             game.players[p.id]["money"] += st["bonus_cash"]
             st["bonus_cash"] = 0
 
+    first_player = game.get_current_player()
     player_mentions = ", ".join(p.mention for p in players)
-    embed = discord.Embed(
-        title="🌍 Mutseri's World Monopoly Started!",
-        color=discord.Color.green()
-    )
-    embed.description = f"A unique randomized board has been generated!\n**Players:** {player_mentions}\n\n🎲 It is {game.get_current_player().mention}'s turn!"
+    deadline_ts = int(time.time()) + 90
 
     view = TurnView(game, ctx.channel.id)
     buf = render_board_image(game)
-    file = discord.File(buf, filename="monopoly_board.png")
-    embed.set_image(url="attachment://monopoly_board.png")
+    visual_file = discord.File(buf, filename="monopoly_board.png")
 
-    msg = await ctx.send(embed=embed, view=view, file=file)
-    view.message = msg  # store reference so timeout can edit instead of re-send
+    action_text = (
+        f"🌍 **Mutseri's World Monopoly Started!**\n"
+        f"A unique randomized world board has been generated!\n"
+        f"**Players:** {player_mentions}\n\n"
+        f"🎲 **{first_player.mention}** goes first!"
+    )
+    financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(game)}"
+    status_text = f"⏳ **Turn Status:** **{first_player.display_name}**'s turn! (⏱️ Expires <t:{deadline_ts}:R>)"
+
+    await view.send_turn_bundle(ctx.channel, visual_file, action_text, financial_text, status_text)
 
 @bot.command(name="trade", aliases=["t"])
-async def trade(ctx, target: discord.Member, offer_cash: int = 0, req_cash: int = 0):
-    """Propose a 90-second trade deal with another player."""
+async def trade(ctx, target: discord.Member, *, trade_details: str = ""):
+    """
+    Propose an arbitrary trade deal (money, properties, or mixed) with another player.
+    Usage:
+      !trade @user Tokyo 100 for London 50
+      !trade @user 100 200
+      !trade @user offer: Tokyo, $100 req: London, $50
+    """
     if ctx.channel.id not in active_games:
         await ctx.send("No active Monopoly game in this channel!")
         return
 
     game = active_games[ctx.channel.id]
     if ctx.author.id not in game.players or target.id not in game.players:
-        await ctx.send("Both players must be in the active game!")
+        await ctx.send("Both players must be active in the current Monopoly game!")
         return
 
-    view = TradeProposalView(game, ctx.author, target, [], offer_cash, [], req_cash)
-    embed = discord.Embed(
-        title="🤝 Trade Proposal Offered! (⏱️ 90s limit)",
-        description=f"**{ctx.author.display_name}** offers **${offer_cash}** to **{target.display_name}** for **${req_cash}**.\n\n{target.mention}, click Accept or Decline within 90s!",
-        color=discord.Color.gold()
+    if ctx.author.id == target.id:
+        await ctx.send("You cannot trade with yourself!")
+        return
+
+    offer_props, offer_cash, req_props, req_cash, err = parse_trade_args(game, ctx.author.id, target.id, trade_details)
+    if err:
+        await ctx.send(f"⚠️ {err}")
+        return
+
+    sender_state = game.get_player_state(ctx.author.id)
+    target_state = game.get_player_state(target.id)
+
+    if sender_state["money"] < offer_cash:
+        await ctx.send(f"You don't have enough cash (${offer_cash}) to offer!")
+        return
+    if target_state["money"] < req_cash:
+        await ctx.send(f"{target.display_name} does not have enough cash (${req_cash}) for this request!")
+        return
+
+    # Check for properties with houses
+    for p in offer_props:
+        if game.board[p].get("houses", 0) > 0:
+            await ctx.send(f"You cannot trade **{game.board[p]['name']}** while it has houses on it! Sell houses first.")
+            return
+    for p in req_props:
+        if game.board[p].get("houses", 0) > 0:
+            await ctx.send(f"Cannot request **{game.board[p]['name']}** while it has houses on it.")
+            return
+
+    view = TradeProposalView(game, ctx.author, target, offer_props, offer_cash, req_props, req_cash)
+
+    offer_desc = [f"• 🏠 **{game.board[p]['name']}** (${game.board[p]['price']})" for p in offer_props]
+    if offer_cash > 0:
+        offer_desc.append(f"• 💰 **${offer_cash} Cash**")
+
+    req_desc = [f"• 🏠 **{game.board[p]['name']}** (${game.board[p]['price']})" for p in req_props]
+    if req_cash > 0:
+        req_desc.append(f"• 💰 **${req_cash} Cash**")
+
+    proposal_text = (
+        f"🤝 **TRADE PROPOSAL** (⏱️ 90s limit)\n"
+        f"**From:** {ctx.author.mention} ➔ **To:** {target.mention}\n\n"
+        f"📤 **Offered by {ctx.author.display_name}:**\n"
+        f"{chr(10).join(offer_desc) if offer_desc else '• Nothing'}\n\n"
+        f"📥 **Requested from {target.display_name}:**\n"
+        f"{chr(10).join(req_desc) if req_desc else '• Nothing'}\n\n"
+        f"{target.mention}, click **Accept Deal** or **Decline Deal** below within 90 seconds!"
     )
-    await ctx.send(embed=embed, view=view)
+    msg = await ctx.send(content=proposal_text, view=view)
+    view.message = msg
+
+@bot.command(name="property", aliases=["properties", "props", "p"])
+async def property_cmd(ctx, member: discord.Member = None):
+    """Shows owned properties, mortgaged status, house/skyscraper counts, and current rent."""
+    if ctx.channel.id not in active_games:
+        await ctx.send("There is no active Monopoly game in this channel!")
+        return
+
+    game = active_games[ctx.channel.id]
+    target = member or ctx.author
+    if target.id not in game.players:
+        await ctx.send(f"**{target.display_name}** is not in the active game!")
+        return
+
+    props = game.get_player_properties_detail(target.id)
+    if not props:
+        await ctx.send(f"🏠 **{target.display_name}** does not own any properties yet.")
+        return
+
+    lines = []
+    total_houses = 0
+    total_skyscrapers = 0
+    monopolies = set()
+
+    for p in props:
+        house_tag = ""
+        if p["houses"] == 5:
+            house_tag = " | 🏙️ **Skyscraper**"
+            total_skyscrapers += 1
+        elif p["houses"] > 0:
+            house_tag = f" | 🏠 **{p['houses']} Houses**"
+            total_houses += p["houses"]
+
+        mort_tag = " | 🔴 **MORTGAGED**" if p["is_mortgaged"] else ""
+        color_icon = COLOR_LABELS.get(p.get("color", ""), "📍")
+        mono_tag = " ⭐ **Monopoly!**" if p["has_monopoly"] else ""
+        if p["has_monopoly"]:
+            monopolies.add(p["color"])
+
+        lines.append(f"{color_icon} **{p['name']}** — Rent: **${p['rent']}**{house_tag}{mort_tag}{mono_tag}")
+
+    summary_line = (
+        f"📊 **Summary:** {len(props)} Properties | {len(monopolies)} Monopolies | "
+        f"{total_houses} Houses | {total_skyscrapers} Skyscrapers"
+    )
+
+    msg = (
+        f"🏠 **Properties Owned by {target.display_name}** ({len(props)} total):\n"
+        + "\n".join(lines) + "\n\n" + summary_line
+    )
+    await ctx.send(msg)
+
+@bot.command(name="balance", aliases=["bal", "cash", "money"])
+async def balance_cmd(ctx, member: discord.Member = None):
+    """Shows player's current cash balance, net worth, equity, and status."""
+    if ctx.channel.id not in active_games:
+        await ctx.send("There is no active Monopoly game in this channel!")
+        return
+
+    game = active_games[ctx.channel.id]
+    target = member or ctx.author
+    if target.id not in game.players:
+        await ctx.send(f"**{target.display_name}** is not in the active game!")
+        return
+
+    st = game.get_player_state(target.id)
+    net_worth = game.get_player_net_worth(target.id)
+    tile_name = game.board[st["position"]]["name"]
+    jail_status = f"🔒 In Border Control (Turns: {st['jail_turns']})" if st["in_jail"] else "Free"
+    passes = st.get("has_jail_card", 0)
+
+    msg = (
+        f"💰 **Financial Overview — {target.display_name}**\n"
+        f"💵 **Cash Balance:** ${st['money']}\n"
+        f"🏠 **Properties Owned:** {len(st['properties'])}\n"
+        f"🏦 **Total Net Worth:** ${net_worth}\n"
+        f"📍 **Position:** Tile #{st['position']} ({tile_name})\n"
+        f"🛂 **Border Control:** {jail_status} | 🎟️ Passes: {passes}"
+    )
+    await ctx.send(msg)
+
+@bot.command(name="left", aliases=["unowned", "available", "remaining"])
+async def left_cmd(ctx):
+    """Shows properties still available/unowned on the board."""
+    if ctx.channel.id not in active_games:
+        await ctx.send("There is no active Monopoly game in this channel!")
+        return
+
+    game = active_games[ctx.channel.id]
+    unowned = game.get_unowned_properties()
+
+    if not unowned:
+        await ctx.send("🗺️ **All properties on the board have been purchased!**")
+        return
+
+    # Group unowned by color or type
+    groups = {}
+    for p in unowned:
+        grp = p.get("color") or p.get("type", "other")
+        groups.setdefault(grp, []).append(p)
+
+    tier_names = {
+        "red": "🔴 Budget Tier",
+        "green": "🟢 Mid-Low Tier",
+        "light_blue": "🔵 Mid-High Tier",
+        "pink": "🩷 Premium Tier",
+        "railroad": "✈️ International Airports",
+        "utility": "⚡ Global Utilities"
+    }
+
+    sections = []
+    for grp_key, items in groups.items():
+        title = tier_names.get(grp_key, f"📍 {grp_key.title()}")
+        item_lines = [f" • **{item['name']}** — ${item['price']}" for item in items]
+        sections.append(f"**{title}** ({len(items)} available):\n" + "\n".join(item_lines))
+
+    msg = f"🗺️ **Available Properties on Board ({len(unowned)} remaining):**\n\n" + "\n\n".join(sections)
+    await ctx.send(msg)
 
 @bot.command(name="daily", aliases=["d"])
 async def daily(ctx):
     """Claims daily reward cash and streak bonuses."""
     success, msg, reward = claim_daily(ctx.author.id, ctx.author.display_name)
-    embed = discord.Embed(
-        title="🎡 Daily Monopoly Reward",
-        description=msg,
-        color=discord.Color.green() if success else discord.Color.orange()
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(f"🎡 **Daily Monopoly Reward:**\n{msg}")
 
 @bot.command(name="stats", aliases=["s"])
 async def stats(ctx, member: discord.Member = None):
     """Displays player statistics and career performance."""
     target = member or ctx.author
     st = get_player_stats(target.id, target.display_name)
-    
+
     played = st.get("games_played", 0)
     wins = st.get("wins", 0)
     win_rate = (wins / played * 100) if played > 0 else 0.0
     token = st.get("custom_token") or "🔴"
 
-    embed = discord.Embed(
-        title=f"📊 Tycoon Stats — {target.display_name}",
-        color=discord.Color.blue()
+    msg = (
+        f"📊 **Tycoon Career Stats — {target.display_name}**\n"
+        f"• Equipped Token: {token}\n"
+        f"• Career Wins: 🏆 {wins}\n"
+        f"• Games Played: 🎲 {played}\n"
+        f"• Win Rate: 📈 {win_rate:.1f}%\n"
+        f"• Daily Streak: 🔥 {st.get('daily_streak', 0)} days\n"
+        f"• Bonus Cash Buffer: 💰 ${st.get('bonus_cash', 0)}"
     )
-    embed.add_field(name="Equipped Token", value=token, inline=True)
-    embed.add_field(name="Career Wins", value=f"🏆 {wins}", inline=True)
-    embed.add_field(name="Games Played", value=f"🎲 {played}", inline=True)
-    embed.add_field(name="Win Rate", value=f"📈 {win_rate:.1f}%", inline=True)
-    embed.add_field(name="Daily Streak", value=f"🔥 {st.get('daily_streak', 0)} days", inline=True)
-    embed.add_field(name="Bonus Cash Buffer", value=f"💰 ${st.get('bonus_cash', 0)}", inline=True)
-
-    await ctx.send(embed=embed)
+    await ctx.send(msg)
 
 @bot.command(name="leaderboard", aliases=["lb", "top"])
 async def leaderboard(ctx):
@@ -614,12 +920,7 @@ async def leaderboard(ctx):
             f"{rank_icon} {token} **{p.get('display_name', 'Player')}** — 🏆 {p.get('wins', 0)} Wins ({p.get('games_played', 0)} played)"
         )
 
-    embed = discord.Embed(
-        title="🏆 Server Monopoly Leaderboard",
-        description="\n".join(lines),
-        color=discord.Color.gold()
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(f"🏆 **Server Monopoly Leaderboard:**\n\n" + "\n".join(lines))
 
 @bot.command(name="set_token", aliases=["st", "token"])
 async def set_token(ctx, emoji: str):
@@ -645,79 +946,40 @@ async def board(ctx):
     game = active_games[ctx.channel.id]
     buf = render_board_image(game)
     file = discord.File(buf, filename="monopoly_board.png")
-    embed = build_board_embed(game)
-    embed.set_image(url="attachment://monopoly_board.png")
-    await ctx.send(embed=embed, file=file)
+    await ctx.send(content="📋 **Live Monopoly Board:**", file=file)
 
 @bot.command(name="help", aliases=["h"])
 async def help_command(ctx):
     """Displays a list of all available commands and how to play."""
-    embed = discord.Embed(
-        title="🌍 Mutseri's World Monopoly — Command Guide",
-        description="Welcome to **Mutseri's World Monopoly**! Here are all the available commands and shortcuts to manage games, trade, check career stats, and claim daily rewards.",
-        color=discord.Color.blue()
+    help_text = (
+        "🌍 **Mutseri's World Monopoly — Command Guide**\n"
+        "Prefixes: `!` or `ms!`\n\n"
+        "🎮 **Game Controls:**\n"
+        "• `!start_monopoly` (`!sm`) @user1 [@user2] — Start a 2–4 player game.\n"
+        "• `!board` (`!b`) — View the live 2D board image.\n"
+        "• `!end_monopoly` (`!em`) — End the active Monopoly game.\n\n"
+        "ℹ️ **Info Commands:**\n"
+        "• `!property` (`!p`) [@user] — View owned properties, houses, rent, and mortgaged status.\n"
+        "• `!balance` (`!bal`) [@user] — Check cash, net worth, equity, and border control status.\n"
+        "• `!left` (`!unowned`) — View remaining available properties on the board.\n\n"
+        "🤝 **Trading:**\n"
+        "• `!trade` (`!t`) @user [offer] for [request] — Propose a trade (money, property, or mixed).\n"
+        "  Examples:\n"
+        "  `!trade @user Tokyo 100 for London 50`\n"
+        "  `!trade @user 100 200`\n"
+        "  `!trade @user offer: Tokyo, $100 req: London, $50`\n\n"
+        "💰 **Daily Rewards & Career:**\n"
+        "• `!daily` (`!d`) — Claim daily cash + streak bonus.\n"
+        "• `!stats` (`!s`) [@user] — View career wins, total games, win rate, and streak.\n"
+        "• `!leaderboard` (`!lb`) — View the top server Monopoly Tycoons.\n"
+        "• `!set_token` (`!st`) <emoji> — Equip a custom token emoji."
     )
-
-    embed.add_field(
-        name="🎮 Game Controls",
-        value=(
-            "`ms!start_monopoly` (`ms!sm`) @user1 [@user2] — Start a 2–4 player game.\n"
-            "`ms!board` (`ms!b`) — View the live 2D board render and full property list.\n"
-            "`ms!end_monopoly` (`ms!em`) — End the active Monopoly game in this channel."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🤝 Trading & Actions",
-        value=(
-            "`ms!trade` (`ms!t`) @user [offer_cash] [req_cash] — Propose a 90s trade deal.\n"
-            "ℹ️ *In-game turn actions (Rolling, Buying, Building, Mortgaging, Unmortgaging, Selling) are played using interactive buttons under the board!*"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="💰 Daily Rewards & Customization",
-        value=(
-            "`ms!daily` (`ms!d`) — Claim daily cash + streak bonus (60h grace period).\n"
-            "`ms!set_token` (`ms!st`) <emoji> — Equip a custom token emoji (`🔴`, `🔵`, `🟢`, `🟡`, `👑`, `🚀`, `💎`, `🦁`, etc.)."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 Stats & Leaderboards",
-        value=(
-            "`ms!stats` (`ms!s`) [@user] — View career wins, total games played, win rate, and streak.\n"
-            "`ms!leaderboard` (`ms!lb`) — View the top 10 Monopoly Tycoons on the server."
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⚡ Shortened Commands Cheat Sheet",
-        value=(
-            "• `ms!sm` ➔ `ms!start_monopoly`\n"
-            "• `ms!em` ➔ `ms!end_monopoly`\n"
-            "• `ms!b` ➔ `ms!board`\n"
-            "• `ms!t` ➔ `ms!trade`\n"
-            "• `ms!d` ➔ `ms!daily`\n"
-            "• `ms!s` ➔ `ms!stats`\n"
-            "• `ms!lb` ➔ `ms!leaderboard`\n"
-            "• `ms!st` ➔ `ms!set_token`\n"
-            "• `ms!h` ➔ `ms!help`"
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text="Command Prefix: ms! • Roll the dice & build your global empire!")
     try:
-        await ctx.author.send(embed=embed)
+        await ctx.author.send(help_text)
         if ctx.guild:
             await ctx.send(f"📬 {ctx.author.mention}, I've sent you the command guide in your Direct Messages!")
     except discord.Forbidden:
-        await ctx.send(f"⚠️ {ctx.author.mention}, I couldn't send you a Direct Message! Please check your privacy settings.", embed=embed)
+        await ctx.send(help_text)
 
 # ---------------------------------------------------------------------------
 # Keep-alive web server (required by Render; pinged by UptimeRobot)
@@ -740,7 +1002,6 @@ async def main():
     if not token:
         print("ERROR: DISCORD_TOKEN environment variable is not set.")
         return
-    # Start the web server and the Discord bot concurrently
     await run_webserver()
     await bot.start(token)
 
@@ -751,4 +1012,5 @@ async def on_command_error(ctx, error):
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 

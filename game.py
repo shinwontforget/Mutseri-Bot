@@ -120,9 +120,11 @@ class MonopolyGame:
             } for player in players
         }
         self.turn_index = 0
+        self.turn_count = 1
         self.player_list = players
         self.properties_owned = {} # pos -> player_id
         self.log = []
+        self.turn_message_history = []  # list of {"turn": int, "messages": list[discord.Message]}
         self.chance_deck = get_fresh_chance_deck()
         self.treasury_deck = get_fresh_treasury_deck()
         
@@ -147,16 +149,17 @@ class MonopolyGame:
         current_player_id = self.get_current_player().id
         self.players[current_player_id]["has_rolled"] = False
         self.turn_index = (self.turn_index + 1) % len(self.player_list)
+        self.turn_count += 1
         # Advance to next active non-bankrupt player
         self.get_current_player()
         
     def roll_dice(self):
         return random.randint(1, 6), random.randint(1, 6)
 
-    def move_player(self, player_id, steps):
+    def move_player(self, player_id, steps) -> tuple[int, int]:
         player = self.players[player_id]
         if player["in_jail"] or player["bankrupt"]:
-            return
+            return player["position"], player["position"]
 
         old_pos = player["position"]
         new_pos = (old_pos + steps) % 40
@@ -173,6 +176,7 @@ class MonopolyGame:
 
         self.log_event(f"{player['member'].display_name} moved to {self.board[new_pos]['name']}.")
         self.handle_landing(player_id, new_pos)
+        return old_pos, new_pos
         
     def handle_landing(self, player_id, pos):
         tile = self.board[pos]
@@ -423,3 +427,63 @@ class MonopolyGame:
         player["properties"] = []
         creditor_name = self.players[creditor_id]["member"].display_name if creditor_id else "the Bank"
         self.log_event(f"💥 {player['member'].display_name} declared BANKRUPTCY and surrendered assets to {creditor_name}!")
+
+    def get_unowned_properties(self) -> list[dict]:
+        """Returns all unowned buyable tiles (properties, railroads, utilities)."""
+        unowned = []
+        for pos, tile in enumerate(self.board):
+            if tile["type"] in ["property", "railroad", "utility"] and pos not in self.properties_owned:
+                unowned.append({"pos": pos, **tile})
+        return unowned
+
+    def get_player_properties_detail(self, player_id: int) -> list[dict]:
+        """Returns structured details of all properties owned by player_id."""
+        player = self.players.get(player_id)
+        if not player:
+            return []
+        details = []
+        for pos in player["properties"]:
+            tile = self.board[pos]
+            rent = self.calculate_rent(pos)
+            has_mono = self.has_monopoly(player_id, tile.get("color", "")) if tile.get("color") else False
+            details.append({
+                "pos": pos,
+                "name": tile["name"],
+                "city": tile.get("city", ""),
+                "country": tile.get("country", ""),
+                "type": tile["type"],
+                "color": tile.get("color", ""),
+                "price": tile.get("price", 0),
+                "houses": tile.get("houses", 0),
+                "is_mortgaged": tile.get("is_mortgaged", False),
+                "rent": rent,
+                "has_monopoly": has_mono
+            })
+        return details
+
+    def find_property_by_name(self, query: str, player_id: int | None = None) -> int | None:
+        """Finds a property position by city name, country, full name, or tile number (1-39)."""
+        q = query.strip().lower()
+        if q.isdigit():
+            pos = int(q)
+            if 0 <= pos < 40 and self.board[pos]["type"] in ["property", "railroad", "utility"]:
+                if player_id is None or pos in self.players[player_id]["properties"]:
+                    return pos
+
+        candidates = []
+        for pos, tile in enumerate(self.board):
+            if tile["type"] not in ["property", "railroad", "utility"]:
+                continue
+            if player_id is not None and pos not in self.players[player_id]["properties"]:
+                continue
+
+            city = tile.get("city", "").lower()
+            country = tile.get("country", "").lower()
+            name = tile.get("name", "").lower()
+
+            if q == city or q == country or q == name:
+                return pos
+            if q in city or q in country or q in name:
+                candidates.append(pos)
+
+        return candidates[0] if candidates else None
