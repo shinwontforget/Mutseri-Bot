@@ -127,7 +127,12 @@ class MonopolyGame:
         self.turn_message_history = []  # list of {"turn": int, "messages": list[discord.Message]}
         self.chance_deck = get_fresh_chance_deck()
         self.treasury_deck = get_fresh_treasury_deck()
+        self.consecutive_inactive_turns = 0
         
+    def record_activity(self):
+        """Resets the consecutive inactive turns counter when any player takes an action."""
+        self.consecutive_inactive_turns = 0
+
     def get_current_player(self):
         # Skip bankrupt players
         active_count = sum(1 for p in self.player_list if not self.players[p.id]["bankrupt"])

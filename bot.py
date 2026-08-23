@@ -85,7 +85,18 @@ def parse_trade_args(game, sender_id: int, target_id: int, raw_args: str) -> tup
             offer_str = parts[0]
             req_str = parts[1]
         else:
-            return [], 0, [], 0, "Could not separate offer and request. Use `for` (e.g. `!trade @user [offer] for [request]`)."
+            found_split = False
+            for split_idx in range(1, len(parts)):
+                cand_offer = " ".join(parts[:split_idx])
+                cand_req = " ".join(parts[split_idx:])
+                if (game.find_property_by_name(cand_offer, sender_id) is not None or cand_offer.replace('$', '').replace(',', '').isdigit()) and \
+                   (game.find_property_by_name(cand_req, target_id) is not None or cand_req.replace('$', '').replace(',', '').isdigit()):
+                    offer_str = cand_offer
+                    req_str = cand_req
+                    found_split = True
+                    break
+            if not found_split:
+                return [], 0, [], 0, "Could not separate offer and request. Use `for` (e.g. `!trade @user [offer] for [request]`)."
 
     offer_str = re.sub(r'^(offer|offering|give|giving):\s*', '', offer_str, flags=re.IGNORECASE).strip()
     req_str = re.sub(r'^(req|request|requesting|want|wants):\s*', '', req_str, flags=re.IGNORECASE).strip()
@@ -159,6 +170,20 @@ class TurnView(discord.ui.View):
             if self.channel_id not in active_games or active_games.get(self.channel_id) != self.game:
                 return
 
+            self.game.consecutive_inactive_turns += 1
+
+            channel = bot.get_channel(self.channel_id)
+            if self.game.consecutive_inactive_turns >= 5:
+                if self.channel_id in active_games:
+                    del active_games[self.channel_id]
+                self.stop()
+                if channel:
+                    await channel.send(
+                        "🛑 **GAME OVER — INACTIVITY**\n"
+                        "⏱️ The game was ended automatically because all players have been inactive for 5 consecutive turns."
+                    )
+                return
+
             current_player = self.game.get_current_player()
             player_state = self.game.get_player_state(current_player.id)
 
@@ -173,7 +198,6 @@ class TurnView(discord.ui.View):
             self.game.next_turn()
 
             next_p = self.game.get_current_player()
-            channel = bot.get_channel(self.channel_id)
             if not channel:
                 return
 
@@ -181,8 +205,9 @@ class TurnView(discord.ui.View):
             visual_file = discord.File(buf, filename="monopoly_board.png")
             deadline_ts = int(time.time()) + 90
 
+            inactivity_warn = f" (⚠️ Inactivity: {self.game.consecutive_inactive_turns}/5 turns without player input)"
             action_text = (
-                f"⏱️ **Turn Timer Expired (90s)**\n"
+                f"⏱️ **Turn Timer Expired (90s)**{inactivity_warn}\n"
                 f"**{current_player.display_name}** took too long! Turn automatically passed to **{next_p.mention}**."
             )
             financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(self.game)}"
@@ -281,6 +306,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         d1, d2 = self.game.roll_dice()
         total = d1 + d2
@@ -326,6 +352,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message(f"You don't have enough money to buy {tile['name']} (${tile['price']})!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.buy_property(current_player.id, pos)
 
@@ -360,6 +387,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message(f"Not enough cash to build on {tile['name']} (${tile['house_price']})!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.build_house(current_player.id, pos)
 
@@ -387,6 +415,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("You have no eligible properties to mortgage!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         pos = unmortgaged[0]
         self.game.mortgage_property(current_player.id, pos)
@@ -423,6 +452,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message(f"You need ${cost} to unmortgage {tile['name']}!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.unmortgage_property(current_player.id, pos)
 
@@ -450,6 +480,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("You have no houses to sell!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         pos = houses[0]
         self.game.sell_house(current_player.id, pos)
@@ -477,6 +508,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("You need $50 to pay bail!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         buf = render_board_image(self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
@@ -496,6 +528,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         d1, d2, escaped = self.game.attempt_jail_doubles(current_player.id)
         deadline_ts = int(time.time()) + 90
@@ -523,6 +556,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.use_jail_card(current_player.id)
         buf = render_board_image(self.game)
@@ -544,6 +578,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.declare_bankruptcy(current_player.id)
         active_players = [p for p in self.game.player_list if not self.game.players[p.id]["bankrupt"]]
@@ -585,6 +620,7 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("⚠️ You have a negative cash balance! Mortgage properties, sell houses, trade, or declare bankruptcy before ending your turn.", ephemeral=True)
             return
 
+        self.game.record_activity()
         await interaction.response.defer()
         self.game.next_turn()
         next_player = self.game.get_current_player()
@@ -605,6 +641,7 @@ class TurnView(discord.ui.View):
         await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def board_callback(self, interaction: discord.Interaction):
+        self.game.record_activity()
         await interaction.response.defer(ephemeral=True)
         buf = render_board_image(self.game)
         file = discord.File(buf, filename="monopoly_board.png")
@@ -614,7 +651,21 @@ class TurnView(discord.ui.View):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("ms!", "!"), intents=intents, help_command=None)
+
+def get_prefix(bot, message):
+    prefixes = ["ms!", "!"]
+    content = message.content or ""
+    content_lower = content.lower()
+    matched = []
+    for p in prefixes:
+        if content_lower.startswith(p):
+            # Return prefix preserving exact case from user message
+            matched.append(content[:len(p)])
+    if bot.user:
+        return commands.when_mentioned_or(*(matched or prefixes))(bot, message)
+    return matched or prefixes
+
+bot = commands.Bot(command_prefix=get_prefix, case_insensitive=True, intents=intents, help_command=None)
 
 active_games = {}
 
