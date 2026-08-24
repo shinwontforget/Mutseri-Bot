@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import logging
 import discord
 from aiohttp import web
 from discord.ext import commands
@@ -151,6 +152,8 @@ class TurnView(discord.ui.View):
         self.channel_id = channel_id
         self.timer_task = None
         self.message: discord.Message | None = None
+        self._rolling = False  # double-click guard for roll
+        self._buying = False   # double-click guard for buy
         self.setup_buttons()
         self.reset_timer()
 
@@ -306,14 +309,18 @@ class TurnView(discord.ui.View):
             await interaction.response.send_message("It's not your turn!", ephemeral=True)
             return
 
+        player_state = self.game.get_player_state(current_player.id)
+        if player_state.get("has_rolled", False) or self._rolling:
+            await interaction.response.send_message("You have already rolled this turn!", ephemeral=True)
+            return
+        self._rolling = True
+        player_state["has_rolled"] = True
+
         self.game.record_activity()
         await interaction.response.defer()
         d1, d2 = self.game.roll_dice()
         total = d1 + d2
         old_pos, new_pos = self.game.move_player(current_player.id, total)
-
-        player_state = self.game.get_player_state(current_player.id)
-        player_state["has_rolled"] = True
         current_tile = self.game.board[new_pos]
 
         # Piece movement animated GIF
@@ -334,6 +341,7 @@ class TurnView(discord.ui.View):
         )
         status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn — Choose an action below (⏱️ Expires <t:{deadline_ts}:R>)"
 
+        self._rolling = False
         self.setup_buttons()
         self.reset_timer()
         await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
@@ -348,13 +356,23 @@ class TurnView(discord.ui.View):
         pos = player_state["position"]
         tile = self.game.board[pos]
 
+        # Double-click guard
+        if self._buying:
+            await interaction.response.send_message("Purchase already in progress!", ephemeral=True)
+            return
+        # Verify property is still available
+        if pos in self.game.properties_owned:
+            await interaction.response.send_message(f"**{tile['name']}** is already owned!", ephemeral=True)
+            return
         if player_state["money"] < tile["price"]:
             await interaction.response.send_message(f"You don't have enough money to buy {tile['name']} (${tile['price']})!", ephemeral=True)
             return
 
+        self._buying = True
         self.game.record_activity()
         await interaction.response.defer()
         self.game.buy_property(current_player.id, pos)
+
 
         buf = render_board_image(self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
@@ -364,6 +382,7 @@ class TurnView(discord.ui.View):
         financial_text = f"💰 **Financial Summary:** Spent **${tile['price']}** | Cash Remaining: **${player_state['money']}**"
         status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
 
+        self._buying = False
         self.setup_buttons()
         self.reset_timer()
         await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
@@ -641,9 +660,14 @@ class TurnView(discord.ui.View):
         await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
 
     async def board_callback(self, interaction: discord.Interaction):
-        self.game.record_activity()
+        # Only active players in this game may request the board
+        player_ids = [p.id for p in self.game.player_list]
+        if interaction.user.id not in player_ids:
+            await interaction.response.send_message("Only players in this game can view the board!", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
-        buf = render_board_image(self.game)
+        # Run heavy PIL rendering off the event loop to keep the bot responsive
+        buf = await asyncio.to_thread(render_board_image, self.game)
         file = discord.File(buf, filename="monopoly_board.png")
         await interaction.followup.send(content="📋 **Current Monopoly Board State:**", file=file, ephemeral=True)
 
@@ -1170,8 +1194,20 @@ async def main():
 
 @bot.event
 async def on_command_error(ctx, error):
-    await ctx.send(f"⚠️ Error: {error}")
-    print(f"Command error: {error}")
+    if isinstance(error, commands.CommandNotFound):
+        return  # Silently ignore unknown commands
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ Missing argument: `{error.param.name}`. Use `!help` for command usage.", delete_after=10)
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"⚠️ Invalid argument. Use `!help` for command usage.", delete_after=10)
+        return
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Command on cooldown. Try again in **{error.retry_after:.1f}s**.", delete_after=5)
+        return
+    # Log unexpected errors to console/server logs only — never expose to public chat
+    logging.error("Unhandled command error in '%s': %s", ctx.command, error, exc_info=error)
+    await ctx.send("⚠️ An internal error occurred while processing this command.", delete_after=10)
 
 if __name__ == "__main__":
     asyncio.run(main())

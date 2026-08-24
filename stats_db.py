@@ -17,8 +17,19 @@ def load_db() -> dict:
     return {}
 
 def save_db(data: dict):
-    with open(DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Atomically writes JSON to a temporary file then replaces target to avoid corruption on crashes."""
+    tmp_path = f"{DB_PATH}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, DB_PATH)
+    except Exception:
+        # Fallback direct write if os.replace fails
+        try:
+            with open(DB_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
 def get_player_stats(user_id: int, display_name: str) -> dict:
     db = load_db()
@@ -37,7 +48,9 @@ def get_player_stats(user_id: int, display_name: str) -> dict:
         }
         save_db(db)
     else:
-        db[uid_str]["display_name"] = display_name
+        if db[uid_str].get("display_name") != display_name:
+            db[uid_str]["display_name"] = display_name
+            save_db(db)
     return db[uid_str]
 
 def record_game_win(winner_id: int, all_player_ids: list[int]):
@@ -64,7 +77,20 @@ def record_game_win(winner_id: int, all_player_ids: list[int]):
 def claim_daily(user_id: int, display_name: str) -> tuple[bool, str, int]:
     db = load_db()
     uid_str = str(user_id)
-    p_data = get_player_stats(user_id, display_name)
+    if uid_str not in db:
+        db[uid_str] = {
+            "display_name": display_name,
+            "games_played": 0,
+            "wins": 0,
+            "properties_bought": 0,
+            "bankruptcies_caused": 0,
+            "last_daily": 0,
+            "daily_streak": 0,
+            "custom_token": None,
+            "bonus_cash": 0
+        }
+    p_data = db[uid_str]
+    p_data["display_name"] = display_name
     now = time.time()
     cooldown = 86400  # 24 hours
 
@@ -87,7 +113,6 @@ def claim_daily(user_id: int, display_name: str) -> tuple[bool, str, int]:
     p_data["daily_streak"] = streak
     p_data["bonus_cash"] = p_data.get("bonus_cash", 0) + reward
 
-    db[uid_str] = p_data
     save_db(db)
 
     unlock_msg = ""
@@ -108,8 +133,10 @@ def set_custom_token(user_id: int, display_name: str, token_emoji: str) -> tuple
 
     db = load_db()
     uid_str = str(user_id)
-    p_data = get_player_stats(user_id, display_name)
-    p_data["custom_token"] = token_emoji
-    db[uid_str] = p_data
+    if uid_str not in db:
+        get_player_stats(user_id, display_name)
+        db = load_db()
+    
+    db[uid_str]["custom_token"] = token_emoji
     save_db(db)
     return True, f"✨ Custom player token set to {token_emoji}!"

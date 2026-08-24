@@ -11,6 +11,11 @@ class TradeProposalView(discord.ui.View):
         self.req_props = req_props
         self.req_cash = req_cash
         self.message: discord.Message | None = None
+        self._processing = False
+
+    def disable_all_items(self):
+        for item in self.children:
+            item.disabled = True
 
     async def on_timeout(self):
         self.disable_all_items()
@@ -30,31 +35,48 @@ class TradeProposalView(discord.ui.View):
             await interaction.response.send_message(f"Only {self.target.display_name} can accept this trade proposal!", ephemeral=True)
             return
 
+        if self._processing:
+            return
+        self._processing = True
+
         sender_state = self.game.get_player_state(self.sender.id)
         target_state = self.game.get_player_state(self.target.id)
 
+        # Check if either player is bankrupt or eliminated
+        if sender_state.get("bankrupt", False) or target_state.get("bankrupt", False):
+            await interaction.response.send_message("Trade cancelled: one of the players has declared bankruptcy.", ephemeral=True)
+            self.disable_all_items()
+            self.stop()
+            return
+
         if sender_state["money"] < self.offer_cash:
             await interaction.response.send_message(f"{self.sender.display_name} no longer has enough cash (${self.offer_cash})!", ephemeral=True)
+            self._processing = False
             return
         if target_state["money"] < self.req_cash:
             await interaction.response.send_message(f"{self.target.display_name} does not have enough cash (${self.req_cash})!", ephemeral=True)
+            self._processing = False
             return
 
         # Check that properties are still owned and not built on (in Monopoly, cannot trade properties with houses)
         for p in self.offer_props:
             if p not in sender_state["properties"]:
                 await interaction.response.send_message(f"{self.sender.display_name} no longer owns {self.game.board[p]['name']}!", ephemeral=True)
+                self._processing = False
                 return
             if self.game.board[p].get("houses", 0) > 0:
                 await interaction.response.send_message(f"Cannot trade {self.game.board[p]['name']} while it still has houses built on it!", ephemeral=True)
+                self._processing = False
                 return
 
         for p in self.req_props:
             if p not in target_state["properties"]:
                 await interaction.response.send_message(f"{self.target.display_name} no longer owns {self.game.board[p]['name']}!", ephemeral=True)
+                self._processing = False
                 return
             if self.game.board[p].get("houses", 0) > 0:
                 await interaction.response.send_message(f"Cannot trade {self.game.board[p]['name']} while it still has houses built on it!", ephemeral=True)
+                self._processing = False
                 return
 
         sender_state["money"] -= self.offer_cash
@@ -74,9 +96,11 @@ class TradeProposalView(discord.ui.View):
                 sender_state["properties"].append(pos)
                 self.game.properties_owned[pos] = self.sender.id
 
+        self.game.record_activity()
         self.game.log_event(f"🤝 TRADE COMPLETED between {self.sender.display_name} and {self.target.display_name}!")
         self.disable_all_items()
-        
+        self.stop()
+
         # Build compact summary of swapped items
         offer_names = [f"**{self.game.board[p]['name']}**" for p in self.offer_props]
         if self.offer_cash > 0:
@@ -99,10 +123,6 @@ class TradeProposalView(discord.ui.View):
             return
 
         self.disable_all_items()
+        self.stop()
         text = f"❌ **Trade Declined:** The trade offer between **{self.sender.display_name}** and **{self.target.display_name}** was declined."
         await interaction.response.edit_message(content=text, view=self, embed=None)
-
-    def disable_all_items(self):
-        for item in self.children:
-            item.disabled = True
-
