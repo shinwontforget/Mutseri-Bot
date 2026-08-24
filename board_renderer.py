@@ -78,91 +78,77 @@ def get_tile_bounds(pos: int, W: int, H: int) -> tuple[int, int, int, int]:
         return (int(0.015 * W), y1, margin_x_left, y2)
     raise ValueError(f"Invalid position {pos}")
 
-def render_board_base(game) -> Image.Image:
-    """Renders the static board template with owner colors, banners, prices, and properties."""
+
+# ---------------------------------------------------------------------------
+# Static layer — tile labels and prices only (no ownership, no houses)
+# Cached on game._static_board_cache keyed by game._static_board_cache_key.
+# ---------------------------------------------------------------------------
+
+def _compute_cache_key(game) -> frozenset:
+    """Returns a hashable key representing ownership + mortgage state."""
+    ownership_items = frozenset(game.properties_owned.items())
+    mortgage_items = frozenset(
+        (pos, game.board[pos].get("is_mortgaged", False))
+        for pos in game.properties_owned
+    )
+    return frozenset([("ownership", ownership_items), ("mortgage", mortgage_items)])
+
+
+def render_static_board(game) -> Image.Image:
+    """
+    Renders (or returns cached) the static board layer:
+    tile outlines from the template + text labels + prices (no owner tints,
+    no house indicators — those are dynamic and composited on top each turn).
+
+    The result is cached on game._static_board_cache. The cache is keyed by
+    ownership + mortgage state (game._static_board_cache_key) and is
+    automatically invalidated whenever game.invalidate_static_cache() is called
+    (which buy_property, mortgage_property, unmortgage_property, and
+    declare_bankruptcy all do).
+    """
+    current_key = _compute_cache_key(game)
+
+    if (
+        game._static_board_cache is not None
+        and game._static_board_cache_key == current_key
+    ):
+        # Return a copy so callers can composite on top without corrupting cache
+        return game._static_board_cache.copy()
+
+    # --- Build the static layer from scratch ---
     if os.path.exists(TEMPLATE_PATH):
         base_img = Image.open(TEMPLATE_PATH).convert("RGBA")
     else:
-        # High quality dark neon fallback canvas if template image missing
         base_img = Image.new("RGBA", (1200, 960), (10, 15, 29, 255))
 
     W, H = base_img.size
-
-    # Create overlay layer for translucent glows, owner banners, and clean text
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-
     font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
 
-    # 1. Overlay Dynamic Property Text, Owner Badges, Recolor Banners & Mortgaged Status
     for pos in range(40):
         x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
         tile = game.board[pos]
         tile_type = tile["type"]
-        is_mortgaged = tile.get("is_mortgaged", False)
         tile_w = x2 - x1
         tile_h = y2 - y1
 
-        # Determine inner text slot zone and banner rectangle for each tile side
         pad = 2
-        banner_rect = None
         if 1 <= pos <= 9:
-            # Top row: color bar at BOTTOM
-            cx1 = x1 + pad
-            cy1 = y1 + pad
-            cx2 = x2 - pad
-            cy2 = y2 - int(tile_h * 0.28)
-            banner_rect = (x1 + 1, cy2, x2 - 1, y2 - 1)
+            cx1 = x1 + pad; cy1 = y1 + pad
+            cx2 = x2 - pad; cy2 = y2 - int(tile_h * 0.28)
         elif 11 <= pos <= 19:
-            # Right column: color bar on LEFT
-            cx1 = x1 + int(tile_w * 0.28)
-            cy1 = y1 + pad
-            cx2 = x2 - pad
-            cy2 = y2 - pad
-            banner_rect = (x1 + 1, y1 + 1, cx1, y2 - 1)
+            cx1 = x1 + int(tile_w * 0.28); cy1 = y1 + pad
+            cx2 = x2 - pad;                 cy2 = y2 - pad
         elif 21 <= pos <= 29:
-            # Bottom row: color bar at TOP (closest to center)
-            cx1 = x1 + pad
-            cy1 = y1 + int(tile_h * 0.28)
-            cx2 = x2 - pad
-            cy2 = y2 - pad
-            banner_rect = (x1 + 1, y1 + 1, x2 - 1, cy1)
+            cx1 = x1 + pad;              cy1 = y1 + int(tile_h * 0.28)
+            cx2 = x2 - pad;              cy2 = y2 - pad
         elif 31 <= pos <= 39:
-            # Left column: color bar on RIGHT
-            cx1 = x1 + pad
-            cy1 = y1 + pad
-            cx2 = x2 - int(tile_w * 0.28)
-            cy2 = y2 - pad
-            banner_rect = (cx2, y1 + 1, x2 - 1, y2 - 1)
+            cx1 = x1 + pad;              cy1 = y1 + pad
+            cx2 = x2 - int(tile_w * 0.28); cy2 = y2 - pad
         else:
             cx1, cy1, cx2, cy2 = x1, y1, x2, y2
 
-        # Color tiles by owner: recolor banner and background when owned
-        if pos in game.properties_owned:
-            owner_id = game.properties_owned[pos]
-            owner_idx = next((i for i, p in enumerate(game.player_list) if p.id == owner_id), 0)
-            scheme = PLAYER_NEON_SCHEMES[owner_idx % len(PLAYER_NEON_SCHEMES)]
-            r, g, b = scheme["rgb"]
-
-            # 1. Recolor banner / header with owner's neon color
-            if banner_rect and tile_type == "property":
-                bx1, by1, bx2, by2 = banner_rect
-                draw.rectangle([bx1, by1, bx2, by2], fill=(r, g, b, 235))
-                draw.rectangle([bx1, by1, bx2, by2], outline=(255, 255, 255, 180), width=1)
-
-            # 2. Recolor inner tile card background with glowing owner tint
-            draw.rectangle([cx1, cy1, cx2, cy2], fill=(r, g, b, 50))
-
-            # 3. Glowing owner border outline around tile frame
-            draw.rectangle([cx1 - 1, cy1 - 1, cx2 + 1, cy2 + 1], outline=(r, g, b, 120), width=3)
-            draw.rectangle([cx1, cy1, cx2, cy2], outline=(r, g, b, 255), width=2)
-
-            # 4. Owner Badge (P1, P2...) in top-left of text slot
-            badge_font = get_font(max(8, int(min(tile_w, tile_h) * 0.14)), bold=True)
-            draw.rectangle([cx1 + 2, cy1 + 2, cx1 + 18, cy1 + 12], fill=(r, g, b, 240))
-            draw.text((cx1 + 10, cy1 + 7), scheme["label"], fill=(0, 0, 0, 255), font=badge_font, anchor="mm")
-
-        # Overlay text & elements directly onto template (NO opaque box fill)
         if pos not in (0, 10, 20, 30):
             clean_label = ""
             clean_label2 = ""
@@ -172,65 +158,58 @@ def render_board_base(game) -> Image.Image:
                 if not city_name:
                     raw_name = tile.get("name", "")
                     city_name = raw_name.split(",")[0].strip()
-                # Clean non-ASCII / emoji characters
                 city_name = "".join([c for c in city_name if ord(c) < 128 or ord(c) > 255]).strip()
                 if not city_name:
                     city_name = tile.get("country", "CITY")
 
                 words = city_name.upper().split()
                 if len(words) == 1:
-                    clean_label = words[0]
-                    clean_label2 = ""
+                    clean_label = words[0]; clean_label2 = ""
                 elif len(words) == 2:
-                    clean_label = words[0]
-                    clean_label2 = words[1]
+                    clean_label = words[0]; clean_label2 = words[1]
                 else:
                     mid = len(words) // 2
                     clean_label = " ".join(words[:mid])
                     clean_label2 = " ".join(words[mid:])
 
             elif tile_type == "community_chest":
-                clean_label = "WORLD"
-                clean_label2 = "TREASURY"
+                clean_label = "WORLD"; clean_label2 = "TREASURY"
             elif tile_type == "chance":
-                clean_label = "GLOBAL"
-                clean_label2 = "NEWS"
+                clean_label = "GLOBAL"; clean_label2 = "NEWS"
             elif tile_type == "tax":
-                clean_label = "TAX"
-                clean_label2 = ""
+                clean_label = "TAX"; clean_label2 = ""
             elif tile_type == "railroad":
                 raw_name = tile.get("name", "")
-                airport_parts = [w for w in raw_name.replace("✈️", "").split() if w.lower() not in ("international", "airport")]
+                airport_parts = [
+                    w for w in raw_name.replace("✈️", "").split()
+                    if w.lower() not in ("international", "airport")
+                ]
                 clean_label = airport_parts[0].upper() if airport_parts else "JFK"
                 clean_label2 = "AIRPORT"
             elif tile_type == "utility":
                 raw_name = tile.get("name", "")
-                utility_parts = [w for w in raw_name.replace("⚡", "").replace("📡", "").replace("☢️", "").replace("🛰️", "").split()]
+                utility_parts = [
+                    w for w in raw_name.replace("⚡", "").replace("📡", "").replace("☢️", "").replace("🛰️", "").split()
+                ]
                 clean_label = utility_parts[0].upper() if utility_parts else "UTILITY"
                 clean_label2 = utility_parts[1].upper() if len(utility_parts) > 1 else ""
             else:
                 clean_label = tile_type.upper()
 
-            # Dynamic Font Sizing to fit slot box
             box_w = cx2 - cx1
             box_h = cy2 - cy1
             narrow = min(box_w, box_h)
-
             base_size = max(8, min(12, int(narrow * 0.20)))
             tile_font = get_font(base_size, bold=True)
             price_font = get_font(max(7, base_size - 2), bold=True)
-
             text_x = (cx1 + cx2) // 2
 
             if tile_type == "property":
                 line_gap = base_size + 2
                 num_lines = 2 if clean_label2 else 1
-                total_h = line_gap * num_lines
                 center_y = (cy1 + cy2) // 2 - 4
+                ty1 = center_y - (line_gap * num_lines) // 2 + line_gap // 2
 
-                ty1 = center_y - total_h // 2 + line_gap // 2
-
-                # Text with drop shadow for high contrast
                 draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                 draw.text((text_x, ty1), clean_label, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
 
@@ -238,7 +217,7 @@ def render_board_base(game) -> Image.Image:
                     draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                     draw.text((text_x, ty1 + line_gap), clean_label2, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
 
-                # Price at bottom of tile slot if unowned
+                # Price only shown for unowned properties
                 if pos not in game.properties_owned:
                     price = tile.get("price", 0)
                     draw.text((text_x + 1, cy2 - base_size // 2 - 1), f"${price}", fill=(0, 0, 0, 240), font=price_font, anchor="mm")
@@ -247,9 +226,8 @@ def render_board_base(game) -> Image.Image:
             else:
                 line_gap = base_size + 2
                 num_lines = 2 if clean_label2 else 1
-                total_h = line_gap * num_lines
                 center_y = (cy1 + cy2) // 2 - 4
-                ty1 = center_y - total_h // 2 + line_gap // 2
+                ty1 = center_y - (line_gap * num_lines) // 2 + line_gap // 2
 
                 draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
                 draw.text((text_x, ty1), clean_label, fill=(255, 235, 170, 255), font=tile_font, anchor="mm")
@@ -265,21 +243,125 @@ def render_board_base(game) -> Image.Image:
                     amount = tile.get("amount", 0)
                     draw.text((text_x, cy2 - base_size // 2 - 2), f"-${amount}", fill=(255, 80, 80, 255), font=price_font, anchor="mm")
 
-            # Draw Mortgaged Status Overlay
-            if is_mortgaged:
-                draw.rectangle([cx1 + 2, (cy1 + cy2)//2 - 8, cx2 - 2, (cy1 + cy2)//2 + 8], fill=(220, 20, 40, 200))
-                draw.text((text_x, (cy1 + cy2)//2), "MORTGAGED", fill=(255, 255, 255, 255), font=price_font, anchor="mm")
+    result = Image.alpha_composite(base_img, overlay)
 
-            # Draw Houses/Skyscraper Indicator on Corner
+    # Store in cache
+    game._static_board_cache = result.copy()
+    game._static_board_cache_key = current_key
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Dynamic layer — ownership tints, banners, house indicators, mortgaged overlays
+# Composited on top of the static layer fresh every render.
+# ---------------------------------------------------------------------------
+
+def render_dynamic_overlay(base_img: Image.Image, game) -> Image.Image:
+    """
+    Composites dynamic elements (owner colours, house indicators, mortgaged
+    overlays) onto *base_img* (which should be the static board layer).
+    Returns a new RGBA image with the overlay applied.
+    """
+    W, H = base_img.size
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
+
+    for pos in range(40):
+        x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
+        tile = game.board[pos]
+        tile_type = tile["type"]
+        is_mortgaged = tile.get("is_mortgaged", False)
+        tile_w = x2 - x1
+        tile_h = y2 - y1
+
+        pad = 2
+        banner_rect = None
+        if 1 <= pos <= 9:
+            cx1 = x1 + pad; cy1 = y1 + pad
+            cx2 = x2 - pad; cy2 = y2 - int(tile_h * 0.28)
+            banner_rect = (x1 + 1, cy2, x2 - 1, y2 - 1)
+        elif 11 <= pos <= 19:
+            cx1 = x1 + int(tile_w * 0.28); cy1 = y1 + pad
+            cx2 = x2 - pad;                 cy2 = y2 - pad
+            banner_rect = (x1 + 1, y1 + 1, cx1, y2 - 1)
+        elif 21 <= pos <= 29:
+            cx1 = x1 + pad;              cy1 = y1 + int(tile_h * 0.28)
+            cx2 = x2 - pad;              cy2 = y2 - pad
+            banner_rect = (x1 + 1, y1 + 1, x2 - 1, cy1)
+        elif 31 <= pos <= 39:
+            cx1 = x1 + pad;              cy1 = y1 + pad
+            cx2 = x2 - int(tile_w * 0.28); cy2 = y2 - pad
+            banner_rect = (cx2, y1 + 1, x2 - 1, y2 - 1)
+        else:
+            cx1, cy1, cx2, cy2 = x1, y1, x2, y2
+
+        # ---- Owner tints + banner ----
+        if pos in game.properties_owned:
+            owner_id = game.properties_owned[pos]
+            owner_idx = next((i for i, p in enumerate(game.player_list) if p.id == owner_id), 0)
+            scheme = PLAYER_NEON_SCHEMES[owner_idx % len(PLAYER_NEON_SCHEMES)]
+            r, g, b = scheme["rgb"]
+
+            if banner_rect and tile_type == "property":
+                bx1, by1, bx2, by2 = banner_rect
+                draw.rectangle([bx1, by1, bx2, by2], fill=(r, g, b, 235))
+                draw.rectangle([bx1, by1, bx2, by2], outline=(255, 255, 255, 180), width=1)
+
+            draw.rectangle([cx1, cy1, cx2, cy2], fill=(r, g, b, 50))
+            draw.rectangle([cx1 - 1, cy1 - 1, cx2 + 1, cy2 + 1], outline=(r, g, b, 120), width=3)
+            draw.rectangle([cx1, cy1, cx2, cy2], outline=(r, g, b, 255), width=2)
+
+            badge_font = get_font(max(8, int(min(tile_w, tile_h) * 0.14)), bold=True)
+            draw.rectangle([cx1 + 2, cy1 + 2, cx1 + 18, cy1 + 12], fill=(r, g, b, 240))
+            draw.text((cx1 + 10, cy1 + 7), scheme["label"], fill=(0, 0, 0, 255), font=badge_font, anchor="mm")
+
+        if pos not in (0, 10, 20, 30):
+            base_size = max(8, min(12, int(min(x2 - x1, y2 - y1) * 0.20)))
+            price_font = get_font(max(7, base_size - 2), bold=True)
+            text_x = (cx1 + cx2) // 2
+
+            # ---- Mortgaged overlay ----
+            if is_mortgaged:
+                draw.rectangle(
+                    [cx1 + 2, (cy1 + cy2) // 2 - 8, cx2 - 2, (cy1 + cy2) // 2 + 8],
+                    fill=(220, 20, 40, 200)
+                )
+                draw.text(
+                    (text_x, (cy1 + cy2) // 2), "MORTGAGED",
+                    fill=(255, 255, 255, 255), font=price_font, anchor="mm"
+                )
+
+            # ---- House / skyscraper indicator ----
             houses = tile.get("houses", 0)
             if houses > 0:
                 h_text = "SKY" if houses == 5 else f"{houses}H"
-                hw = 24
-                hh = 12
+                hw, hh = 24, 12
                 draw.rectangle([cx2 - hw - 2, cy1 + 2, cx2 - 2, cy1 + hh + 2], fill=(0, 220, 130, 240))
-                draw.text((cx2 - hw // 2 - 2, cy1 + hh // 2 + 2), h_text, fill=(0, 0, 0, 255), font=font_tiny, anchor="mm")
+                draw.text(
+                    (cx2 - hw // 2 - 2, cy1 + hh // 2 + 2), h_text,
+                    fill=(0, 0, 0, 255), font=font_tiny, anchor="mm"
+                )
 
     return Image.alpha_composite(base_img, overlay)
+
+
+# ---------------------------------------------------------------------------
+# Public API — signatures unchanged from the original file
+# ---------------------------------------------------------------------------
+
+def render_board_base(game) -> Image.Image:
+    """
+    Renders the board with owner colours, banners, prices, and house indicators.
+
+    Internally uses the cached static layer (render_static_board) and
+    composites dynamic elements on top (render_dynamic_overlay).
+    The static layer is rebuilt only when ownership/mortgage state changes.
+    """
+    static_img = render_static_board(game)
+    return render_dynamic_overlay(static_img, game)
+
 
 def draw_player_tokens_on_image(base_img: Image.Image, game, positions_override: dict[int, int] | None = None) -> Image.Image:
     """Draws multi-layer glowing player tokens on the pre-rendered board image."""
@@ -333,6 +415,7 @@ def draw_player_tokens_on_image(base_img: Image.Image, game, positions_override:
 
     return Image.alpha_composite(base_img, overlay).convert("RGB")
 
+
 def render_board_image(game, positions_override: dict[int, int] | None = None) -> io.BytesIO:
     """Renders a static single PNG frame of the board."""
     base_img = render_board_base(game)
@@ -343,10 +426,12 @@ def render_board_image(game, positions_override: dict[int, int] | None = None) -
     buf.seek(0)
     return buf
 
+
 def render_board_movement_animation(game, moving_player_id: int, start_pos: int, end_pos: int) -> io.BytesIO:
     """
     Renders an animated GIF showing the token sliding tile-by-tile from start_pos to end_pos.
     Intermediate frames have short durations and the final frame pauses.
+    The static board layer is reused across all frames for efficiency.
     """
     # Calculate stepping path along the 40-tile perimeter track
     if start_pos == end_pos:
@@ -360,6 +445,7 @@ def render_board_movement_animation(game, moving_player_id: int, start_pos: int,
     if len(path) <= 1:
         return render_board_image(game)
 
+    # Render the dynamic base (ownership tints etc.) once and reuse across frames
     base_img = render_board_base(game)
     frames = []
 

@@ -13,6 +13,50 @@ HOUSE_PRICES = {
     "dark_blue": 200,
 }
 
+# World event system configuration
+WORLD_EVENT_INTERVAL = 9   # trigger every N total turns across all players
+WORLD_EVENT_DURATION = 3   # each event lasts this many turns
+
+# Available world events pool
+WORLD_EVENTS = [
+    {
+        "id": "recession",
+        "title": "🌩️ Global Recession",
+        "description": "Economic downturn — all property rents are halved this round!",
+        "rent_multiplier": 0.5,
+        "color_group": None,
+    },
+    {
+        "id": "tourism_boom",
+        "title": "🌅 Tourism Boom",
+        "description": "A spike in international tourism — rent doubled on one color group!",
+        "rent_multiplier": 2.0,
+        "color_group": "__random__",  # resolved at trigger time
+    },
+    {
+        "id": "free_trade_zone",
+        "title": "🤝 Free Trade Zone",
+        "description": "International trade agreement — no property taxes collected this round!",
+        "rent_multiplier": 1.0,
+        "color_group": None,
+    },
+    {
+        "id": "infrastructure_boom",
+        "title": "🏗️ Infrastructure Boom",
+        "description": "Global construction surge — rent on all utilities and airports doubled!",
+        "rent_multiplier": 2.0,
+        "color_group": "__transport__",  # special tag for railroads + utilities
+    },
+    {
+        "id": "sanctions",
+        "title": "🚫 International Sanctions",
+        "description": "Geopolitical tensions — rent on premium properties halved!",
+        "rent_multiplier": 0.5,
+        "color_group": "__random__",  # resolved at trigger time
+    },
+]
+
+
 def _make_city_tile(country, city_index, color, price, rent):
     """Create a single city property tile from a country's city list."""
     c = country
@@ -128,7 +172,18 @@ class MonopolyGame:
         self.chance_deck = get_fresh_chance_deck()
         self.treasury_deck = get_fresh_treasury_deck()
         self.consecutive_inactive_turns = 0
-        
+
+        # Static board render cache (board_renderer.py uses this)
+        self._static_board_cache = None
+        self._static_board_cache_key = None
+
+        # World event system
+        self.active_event = None          # dict or None: {id, title, description, rent_multiplier, color_group, turns_remaining}
+        self.total_turns_elapsed = 0      # incremented in next_turn()
+        self._last_event_turn = 0         # turn at which the last event was triggered
+        self._just_triggered_event = None # set for one turn so bot.py can announce it
+        self._just_expired_event = None   # set for one turn so bot.py can announce expiry
+
     def record_activity(self):
         """Resets the consecutive inactive turns counter when any player takes an action."""
         self.consecutive_inactive_turns = 0
@@ -155,9 +210,64 @@ class MonopolyGame:
         self.players[current_player_id]["has_rolled"] = False
         self.turn_index = (self.turn_index + 1) % len(self.player_list)
         self.turn_count += 1
+        self.total_turns_elapsed += 1
         # Advance to next active non-bankrupt player
         self.get_current_player()
-        
+        # Check and tick world events
+        self._tick_world_event()
+
+    def _tick_world_event(self):
+        """Ticks down active event duration and potentially triggers a new one."""
+        self._just_triggered_event = None
+        self._just_expired_event = None
+
+        # Tick down active event
+        if self.active_event is not None:
+            self.active_event["turns_remaining"] -= 1
+            if self.active_event["turns_remaining"] <= 0:
+                self._just_expired_event = self.active_event
+                self.active_event = None
+                self.log_event(f"📰 World Event **{self._just_expired_event['title']}** has ended.")
+
+        # Trigger a new event if interval reached and none active
+        if (
+            self.active_event is None
+            and self.total_turns_elapsed > 0
+            and self.total_turns_elapsed % WORLD_EVENT_INTERVAL == 0
+        ):
+            self._trigger_world_event()
+
+    def _trigger_world_event(self):
+        """Picks a random world event and activates it."""
+        color_groups = list({
+            t.get("color") for t in self.board
+            if t.get("color") and t["type"] == "property"
+        })
+
+        event_template = random.choice(WORLD_EVENTS)
+        event = dict(event_template)  # shallow copy so we can mutate color_group safely
+
+        # Resolve dynamic color group
+        if event["color_group"] == "__random__" and color_groups:
+            event["color_group"] = random.choice(color_groups)
+            event["description"] = (
+                event["description"].rstrip("!")
+                + f" ({event['color_group'].replace('_', ' ').title()} properties)!"
+            )
+
+        event["turns_remaining"] = WORLD_EVENT_DURATION
+        self.active_event = event
+        self._just_triggered_event = event
+        self.log_event(
+            f"🌍 **WORLD EVENT:** {event['title']} — {event['description']} "
+            f"(Lasts {WORLD_EVENT_DURATION} turns)"
+        )
+
+    def invalidate_static_cache(self):
+        """Call after any change that affects static board visuals (ownership, mortgage)."""
+        self._static_board_cache = None
+        self._static_board_cache_key = None
+
     def roll_dice(self):
         return random.randint(1, 6), random.randint(1, 6)
 
@@ -180,25 +290,59 @@ class MonopolyGame:
             self.log_event(f"🛫 {player['member'].display_name} passed START and collected $200.")
 
         self.log_event(f"{player['member'].display_name} moved to {self.board[new_pos]['name']}.")
-        self.handle_landing(player_id, new_pos)
+        landing_result = self.handle_landing(player_id, new_pos)
         return old_pos, new_pos
-        
-    def handle_landing(self, player_id, pos):
+
+    def handle_landing(self, player_id, pos) -> dict:
+        """
+        Processes landing on a tile and returns a structured result dict.
+
+        Returns:
+            dict with keys:
+              - "type": the tile type string
+              - "auto_resolved": True if no player decision is needed
+              - "needs_buy_prompt": True if player should be offered a Buy button
+              - "needs_auction": True if player should be offered Buy + Decline/Auction
+              - "rent_paid": int rent amount if rent was paid (else 0)
+              - "tax_paid": int tax amount if tax was paid (else 0)
+        """
         tile = self.board[pos]
         player = self.players[player_id]
-        
+        result = {
+            "type": tile["type"],
+            "auto_resolved": True,
+            "needs_buy_prompt": False,
+            "needs_auction": False,
+            "rent_paid": 0,
+            "tax_paid": 0,
+        }
+
         if tile["type"] == "tax":
-            player["money"] -= tile["amount"]
-            self.log_event(f"{player['member'].display_name} paid {tile['name']} of ${tile['amount']}.")
+            # Free trade zone event suppresses tax
+            if self.active_event and self.active_event["id"] == "free_trade_zone":
+                self.log_event(
+                    f"🤝 Free Trade Zone: {player['member'].display_name} is exempt from "
+                    f"{tile['name']} (${tile['amount']}) this round!"
+                )
+            else:
+                player["money"] -= tile["amount"]
+                result["tax_paid"] = tile["amount"]
+                self.log_event(
+                    f"{player['member'].display_name} paid {tile['name']} of ${tile['amount']}."
+                )
+
         elif tile["type"] == "go_to_jail":
             player["position"] = 10
             player["in_jail"] = True
             player["jail_turns"] = 0
             self.log_event(f"{player['member'].display_name} was held at Border Control!")
+
         elif tile["type"] == "chance":
             self.draw_and_execute_card(player_id, "chance")
+
         elif tile["type"] == "community_chest":
             self.draw_and_execute_card(player_id, "treasury")
+
         elif tile["type"] in ["property", "railroad", "utility"]:
             if pos in self.properties_owned:
                 owner_id = self.properties_owned[pos]
@@ -206,11 +350,26 @@ class MonopolyGame:
                     rent = self.calculate_rent(pos)
                     player["money"] -= rent
                     self.players[owner_id]["money"] += rent
-                    self.log_event(f"{player['member'].display_name} paid ${rent} rent to {self.players[owner_id]['member'].display_name}.")
+                    result["rent_paid"] = rent
+                    self.log_event(
+                        f"{player['member'].display_name} paid ${rent} rent to "
+                        f"{self.players[owner_id]['member'].display_name}."
+                    )
                 elif self.board[pos].get("is_mortgaged", False):
                     self.log_event(f"{tile['name']} is mortgaged. No rent collected!")
+                # Own property — trivially resolved, no action needed
             else:
-                self.log_event(f"{tile['name']} is unowned. {player['member'].display_name} can buy it for ${tile['price']}.")
+                # Unowned — player decision required
+                result["auto_resolved"] = False
+                result["needs_buy_prompt"] = True
+                result["needs_auction"] = True
+                self.log_event(
+                    f"{tile['name']} is unowned. {player['member'].display_name} "
+                    f"can buy it for ${tile['price']}."
+                )
+
+        # All other tile types (go, jail/visiting, free_parking) are trivially resolved
+        return result
 
     # --- Card Actions ---
     def draw_and_execute_card(self, player_id, deck_type: str) -> dict:
@@ -277,22 +436,57 @@ class MonopolyGame:
             return 0
             
         t_type = tile["type"]
+        base_rent = 0
+
         if t_type == "property":
             houses = tile.get("houses", 0)
             owner_id = self.properties_owned.get(pos)
             if houses > 0:
-                return tile["rent"][houses]
+                base_rent = tile["rent"][houses]
             elif owner_id and self.has_monopoly(owner_id, tile["color"]):
-                return tile["rent"][0] * 2
-            return tile["rent"][0]
+                base_rent = tile["rent"][0] * 2
+            else:
+                base_rent = tile["rent"][0]
         elif t_type == "railroad":
             owner_id = self.properties_owned[pos]
             owner = self.players[owner_id]
-            count = sum(1 for p in owner["properties"] if self.board[p]["type"] == "railroad" and not self.board[p].get("is_mortgaged", False))
-            return 25 * (2 ** (count - 1)) if count > 0 else 25
+            count = sum(
+                1 for p in owner["properties"]
+                if self.board[p]["type"] == "railroad" and not self.board[p].get("is_mortgaged", False)
+            )
+            base_rent = 25 * (2 ** (count - 1)) if count > 0 else 25
         elif t_type == "utility":
-            return 20
-        return 0
+            base_rent = 20
+
+        if base_rent == 0:
+            return 0
+
+        # Apply active world event modifier
+        if self.active_event:
+            ev = self.active_event
+            ev_id = ev["id"]
+            color_group = ev.get("color_group")
+
+            if ev_id == "recession":
+                # All rents halved
+                base_rent = max(1, int(base_rent * ev["rent_multiplier"]))
+
+            elif ev_id == "tourism_boom" and color_group:
+                # Rent doubled only on the specified color group
+                if t_type == "property" and tile.get("color") == color_group:
+                    base_rent = int(base_rent * ev["rent_multiplier"])
+
+            elif ev_id == "infrastructure_boom":
+                # Rent doubled on railroads and utilities
+                if t_type in ("railroad", "utility"):
+                    base_rent = int(base_rent * ev["rent_multiplier"])
+
+            elif ev_id == "sanctions" and color_group:
+                # Rent halved on the specified color group
+                if t_type == "property" and tile.get("color") == color_group:
+                    base_rent = max(1, int(base_rent * ev["rent_multiplier"]))
+
+        return base_rent
 
     def build_house(self, player_id, pos) -> bool:
         tile = self.board[pos]
@@ -333,6 +527,7 @@ class MonopolyGame:
             mortgage_val = tile["price"] // 2
             tile["is_mortgaged"] = True
             player["money"] += mortgage_val
+            self.invalidate_static_cache()
             self.log_event(f"🏦 {player['member'].display_name} mortgaged {tile['name']} for ${mortgage_val}.")
             return True
         return False
@@ -348,6 +543,7 @@ class MonopolyGame:
         ):
             tile["is_mortgaged"] = False
             player["money"] -= cost
+            self.invalidate_static_cache()
             self.log_event(f"🏦 {player['member'].display_name} unmortgaged {tile['name']} for ${cost}.")
             return True
         return False
@@ -359,6 +555,7 @@ class MonopolyGame:
             player["money"] -= tile["price"]
             self.properties_owned[pos] = player_id
             player["properties"].append(pos)
+            self.invalidate_static_cache()
             self.log_event(f"{player['member'].display_name} bought {tile['name']} for ${tile['price']}.")
             return True
         return False
@@ -430,6 +627,7 @@ class MonopolyGame:
                 self.board[pos]["is_mortgaged"] = False
                 
         player["properties"] = []
+        self.invalidate_static_cache()
         creditor_name = self.players[creditor_id]["member"].display_name if creditor_id else "the Bank"
         self.log_event(f"💥 {player['member'].display_name} declared BANKRUPTCY and surrendered assets to {creditor_name}!")
 

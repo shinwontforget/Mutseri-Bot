@@ -47,6 +47,15 @@ async def cleanup_turn_messages(game, channel):
             remaining_history.append(entry)
     game.turn_message_history = remaining_history
 
+def format_active_event(game) -> str | None:
+    """Returns a formatted banner string if a world event is currently active."""
+    if game.active_event:
+        ev = game.active_event
+        rem = ev.get("turns_remaining", 0)
+        turn_str = f"{rem} turn{'s' if rem != 1 else ''} remaining"
+        return f"🌍 **Active World Event:** {ev['title']} — {ev['description']} (⏳ {turn_str})"
+    return None
+
 def format_scorecard_lines(game) -> str:
     """Formats player cash and property balances in clean plain text."""
     lines = []
@@ -58,6 +67,10 @@ def format_scorecard_lines(game) -> str:
         bankrupt_tag = " [💥 BANKRUPT]" if st.get("bankrupt", False) else ""
         prop_cnt = len(st["properties"])
         lines.append(f"{token} **{p.display_name}**: 💰 ${st['money']} | 🏠 {prop_cnt} props{jail_tag}{bankrupt_tag}")
+    
+    event_str = format_active_event(game)
+    if event_str:
+        lines.append(f"\n{event_str}")
     return "\n".join(lines)
 
 def parse_trade_args(game, sender_id: int, target_id: int, raw_args: str) -> tuple[list[int], int, list[int], int, str | None]:
@@ -144,6 +157,187 @@ def parse_trade_args(game, sender_id: int, target_id: int, raw_args: str) -> tup
     return offer_props, offer_cash, req_props, req_cash, None
 
 
+# ---------------------------------------------------------------------------
+# Auction View — lightweight turn-based bidding mode
+# ---------------------------------------------------------------------------
+
+class AuctionView(discord.ui.View):
+    """
+    Handles property auctions when the landed-on player declines to purchase.
+    Cycles through eligible bidders in turn order.
+    """
+    def __init__(self, game, channel_id: int, pos: int, decliner_id: int, parent_turn_view: "TurnView"):
+        super().__init__(timeout=30.0)
+        self.game = game
+        self.channel_id = channel_id
+        self.pos = pos
+        self.tile = game.board[pos]
+        self.decliner_id = decliner_id
+        self.parent_turn_view = parent_turn_view
+
+        # Eligible bidders: all active non-bankrupt players (excluding decliner)
+        self.active_bidders = [
+            p for p in game.player_list
+            if not game.players[p.id]["bankrupt"] and p.id != decliner_id
+        ]
+        self.bidder_idx = 0
+        self.highest_bid = 0
+        self.highest_bidder: discord.Member | None = None
+        self.message: discord.Message | None = None
+        self.concluded = False
+        self.setup_auction_buttons()
+
+    def setup_auction_buttons(self):
+        self.clear_items()
+        if not self.active_bidders or self.concluded:
+            return
+
+        current_bidder = self.active_bidders[self.bidder_idx % len(self.active_bidders)]
+        bidder_money = self.game.players[current_bidder.id]["money"]
+
+        # Option: Bid +$10
+        if bidder_money >= self.highest_bid + 10:
+            b10 = discord.ui.Button(label=f"💵 Bid ${self.highest_bid + 10} (+10)", style=discord.ButtonStyle.green, custom_id="bid_10")
+            b10.callback = lambda i: self.handle_bid(i, 10)
+            self.add_item(b10)
+
+        # Option: Bid +$25
+        if bidder_money >= self.highest_bid + 25:
+            b25 = discord.ui.Button(label=f"💵 Bid ${self.highest_bid + 25} (+25)", style=discord.ButtonStyle.blurple, custom_id="bid_25")
+            b25.callback = lambda i: self.handle_bid(i, 25)
+            self.add_item(b25)
+
+        # Option: Bid +$50
+        if bidder_money >= self.highest_bid + 50:
+            b50 = discord.ui.Button(label=f"💵 Bid ${self.highest_bid + 50} (+50)", style=discord.ButtonStyle.primary, custom_id="bid_50")
+            b50.callback = lambda i: self.handle_bid(i, 50)
+            self.add_item(b50)
+
+        # Option: Pass
+        pass_btn = discord.ui.Button(label="❌ Pass", style=discord.ButtonStyle.red, custom_id="auction_pass")
+        pass_btn.callback = self.handle_pass
+        self.add_item(pass_btn)
+
+    def build_auction_text(self) -> str:
+        if not self.active_bidders:
+            return f"🏛️ **Auction for {self.tile['name']} has ended.**"
+
+        current_bidder = self.active_bidders[self.bidder_idx % len(self.active_bidders)]
+        high_str = f"**${self.highest_bid}** by {self.highest_bidder.mention}" if self.highest_bidder else "*No bids yet ($0)*"
+        remaining_names = ", ".join(p.display_name for p in self.active_bidders)
+
+        return (
+            f"🏛️ **PROPERTY AUCTION: {self.tile['name']}** (List Price: ${self.tile['price']})\n"
+            f"💰 **Current High Bid:** {high_str}\n"
+            f"👥 **Active Bidders ({len(self.active_bidders)}):** {remaining_names}\n\n"
+            f"👉 **{current_bidder.mention}'s turn to bid or pass** (⏱️ 30s limit)"
+        )
+
+    async def on_timeout(self):
+        if self.concluded:
+            return
+        # Current bidder automatically passes on timeout
+        if self.active_bidders:
+            current_bidder = self.active_bidders[self.bidder_idx % len(self.active_bidders)]
+            self.game.log_event(f"⏱️ {current_bidder.display_name} timed out in auction and passed.")
+            self.active_bidders.remove(current_bidder)
+            await self.check_auction_end_or_advance()
+
+    async def handle_bid(self, interaction: discord.Interaction, increment: int):
+        if not self.active_bidders:
+            return
+        current_bidder = self.active_bidders[self.bidder_idx % len(self.active_bidders)]
+        if interaction.user.id != current_bidder.id:
+            await interaction.response.send_message(f"It's {current_bidder.display_name}'s turn to bid!", ephemeral=True)
+            return
+
+        new_bid = self.highest_bid + increment
+        bidder_state = self.game.players[current_bidder.id]
+        if bidder_state["money"] < new_bid:
+            await interaction.response.send_message("You don't have enough money for this bid!", ephemeral=True)
+            return
+
+        self.highest_bid = new_bid
+        self.highest_bidder = current_bidder
+        self.game.log_event(f"🏛️ {current_bidder.display_name} bid ${new_bid} on {self.tile['name']}.")
+
+        # If only 1 bidder left and they just bid, they win
+        if len(self.active_bidders) == 1:
+            await self.conclude_auction(interaction)
+            return
+
+        # Advance to next bidder
+        self.bidder_idx = (self.bidder_idx + 1) % len(self.active_bidders)
+        self.setup_auction_buttons()
+        await interaction.response.edit_message(content=self.build_auction_text(), view=self)
+
+    async def handle_pass(self, interaction: discord.Interaction):
+        if not self.active_bidders:
+            return
+        current_bidder = self.active_bidders[self.bidder_idx % len(self.active_bidders)]
+        if interaction.user.id != current_bidder.id:
+            await interaction.response.send_message(f"It's {current_bidder.display_name}'s turn to act!", ephemeral=True)
+            return
+
+        self.game.log_event(f"🏛️ {current_bidder.display_name} passed on {self.tile['name']}.")
+        self.active_bidders.remove(current_bidder)
+        await self.check_auction_end_or_advance(interaction)
+
+    async def check_auction_end_or_advance(self, interaction: discord.Interaction | None = None):
+        # Case 1: No bidders left or only 1 bidder left who holds highest bid
+        if len(self.active_bidders) == 0 or (len(self.active_bidders) == 1 and self.highest_bidder == self.active_bidders[0]):
+            await self.conclude_auction(interaction)
+            return
+
+        self.bidder_idx %= len(self.active_bidders)
+        self.setup_auction_buttons()
+        if interaction:
+            await interaction.response.edit_message(content=self.build_auction_text(), view=self)
+        elif self.message:
+            try:
+                await self.message.edit(content=self.build_auction_text(), view=self)
+            except Exception:
+                pass
+
+    async def conclude_auction(self, interaction: discord.Interaction | None = None):
+        self.concluded = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        channel = bot.get_channel(self.channel_id)
+        if self.highest_bidder and self.highest_bid > 0:
+            winner = self.highest_bidder
+            self.game.players[winner.id]["money"] -= self.highest_bid
+            self.game.properties_owned[self.pos] = winner.id
+            self.game.players[winner.id]["properties"].append(self.pos)
+            self.game.invalidate_static_cache()
+            self.game.log_event(f"🎉 {winner.display_name} WON the auction for {self.tile['name']} for ${self.highest_bid}!")
+
+            win_text = (
+                f"🎉 **AUCTION CONCLUDED!**\n"
+                f"🏆 **{winner.mention}** won **{self.tile['name']}** with a winning bid of **${self.highest_bid}**!\n"
+                f"💰 Balance remaining: **${self.game.players[winner.id]['money']}**"
+            )
+        else:
+            win_text = (
+                f"🏛️ **AUCTION CONCLUDED!**\n"
+                f"All players passed. **{self.tile['name']}** remains unowned."
+            )
+
+        if interaction:
+            await interaction.response.edit_message(content=win_text, view=self)
+        elif self.message:
+            try:
+                await self.message.edit(content=win_text, view=self)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Main Turn View
+# ---------------------------------------------------------------------------
+
 class TurnView(discord.ui.View):
     def __init__(self, game, channel_id):
         super().__init__(timeout=None)
@@ -204,7 +398,8 @@ class TurnView(discord.ui.View):
             if not channel:
                 return
 
-            buf = render_board_image(self.game)
+            # Offload PIL rendering to executor thread
+            buf = await asyncio.to_thread(render_board_image, self.game)
             visual_file = discord.File(buf, filename="monopoly_board.png")
             deadline_ts = int(time.time()) + 90
 
@@ -266,10 +461,19 @@ class TurnView(discord.ui.View):
                 pos = player_state["position"]
                 tile = self.game.board[pos]
 
-                if tile["type"] in ["property", "railroad", "utility"] and pos not in self.game.properties_owned:
+                # Genuine decision: unowned property and player has enough money to buy
+                if (
+                    tile["type"] in ["property", "railroad", "utility"]
+                    and pos not in self.game.properties_owned
+                    and player_state["money"] >= tile["price"]
+                ):
                     buy_btn = discord.ui.Button(label=f"🏠 Buy for ${tile['price']}", style=discord.ButtonStyle.green, custom_id="buy")
                     buy_btn.callback = self.buy_callback
                     self.add_item(buy_btn)
+
+                    decline_btn = discord.ui.Button(label="🚫 Decline / Auction", style=discord.ButtonStyle.secondary, custom_id="decline_auction")
+                    decline_btn.callback = self.decline_callback
+                    self.add_item(decline_btn)
 
                 has_monopolies = any(self.game.has_monopoly(current_player.id, color) for color in COLOR_LABELS)
                 if has_monopolies:
@@ -318,21 +522,28 @@ class TurnView(discord.ui.View):
 
         self.game.record_activity()
         await interaction.response.defer()
+
         d1, d2 = self.game.roll_dice()
         total = d1 + d2
         old_pos, new_pos = self.game.move_player(current_player.id, total)
         current_tile = self.game.board[new_pos]
 
-        # Piece movement animated GIF
-        anim_buf = render_board_movement_animation(self.game, current_player.id, old_pos, new_pos)
+        # Offload animated GIF rendering to executor thread
+        anim_buf = await asyncio.to_thread(render_board_movement_animation, self.game, current_player.id, old_pos, new_pos)
         visual_file = discord.File(anim_buf, filename="monopoly_move.gif")
 
         deadline_ts = int(time.time()) + 90
         recent_log = self.game.log[-2:] if len(self.game.log) >= 2 else self.game.log[-1:]
 
+        # Auto-resolve note if trivial tile / insufficient funds
+        auto_note = ""
+        if current_tile["type"] in ["property", "railroad", "utility"]:
+            if new_pos not in self.game.properties_owned and player_state["money"] < current_tile["price"]:
+                auto_note = f"\n⚠️ *Insufficient funds to buy {current_tile['name']} (${current_tile['price']}) — purchase skipped.*"
+
         action_text = (
             f"🎲 **{current_player.display_name}** rolled **[{d1}, {d2}] (Total: {total})**!\n"
-            f"📍 Landed on **{current_tile['name']}**.\n"
+            f"📍 Landed on **{current_tile['name']}**.{auto_note}\n"
             f"📜 " + " | ".join(recent_log)
         )
         financial_text = (
@@ -373,8 +584,7 @@ class TurnView(discord.ui.View):
         await interaction.response.defer()
         self.game.buy_property(current_player.id, pos)
 
-
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
         deadline_ts = int(time.time()) + 90
 
@@ -386,6 +596,55 @@ class TurnView(discord.ui.View):
         self.setup_buttons()
         self.reset_timer()
         await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
+
+    async def decline_callback(self, interaction: discord.Interaction):
+        """Starts an auction among the other active players for the declined property."""
+        current_player = self.game.get_current_player()
+        if interaction.user.id != current_player.id:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        player_state = self.game.get_player_state(current_player.id)
+        pos = player_state["position"]
+        tile = self.game.board[pos]
+
+        if pos in self.game.properties_owned:
+            await interaction.response.send_message("This property is already owned!", ephemeral=True)
+            return
+
+        self.game.record_activity()
+        await interaction.response.defer()
+
+        self.game.log_event(f"🏛️ {current_player.display_name} declined to buy {tile['name']}. Starting auction!")
+
+        # Refresh turn view without the buy/decline buttons
+        self.setup_buttons()
+        # Remove buy/decline buttons from the current turn view
+        self.clear_items()
+        has_monopolies = any(self.game.has_monopoly(current_player.id, color) for color in COLOR_LABELS)
+        if has_monopolies:
+            build_btn = discord.ui.Button(label="🏗️ Build House", style=discord.ButtonStyle.primary, custom_id="build")
+            build_btn.callback = self.build_callback
+            self.add_item(build_btn)
+
+        end_btn = discord.ui.Button(label="⏩ End Turn", style=discord.ButtonStyle.red, custom_id="end")
+        end_btn.callback = self.end_callback
+        self.add_item(end_btn)
+
+        board_btn = discord.ui.Button(label="📋 View Board", style=discord.ButtonStyle.grey, custom_id="board")
+        board_btn.callback = self.board_callback
+        self.add_item(board_btn)
+
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+        # Spawn Auction View in channel
+        auction_view = AuctionView(self.game, interaction.channel_id, pos, current_player.id, self)
+        auc_msg = await interaction.channel.send(content=auction_view.build_auction_text(), view=auction_view)
+        auction_view.message = auc_msg
 
     async def build_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -410,7 +669,7 @@ class TurnView(discord.ui.View):
         await interaction.response.defer()
         self.game.build_house(current_player.id, pos)
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
         deadline_ts = int(time.time()) + 90
 
@@ -440,7 +699,7 @@ class TurnView(discord.ui.View):
         self.game.mortgage_property(current_player.id, pos)
         tile = self.game.board[pos]
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
         deadline_ts = int(time.time()) + 90
 
@@ -475,7 +734,7 @@ class TurnView(discord.ui.View):
         await interaction.response.defer()
         self.game.unmortgage_property(current_player.id, pos)
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
         deadline_ts = int(time.time()) + 90
 
@@ -505,7 +764,7 @@ class TurnView(discord.ui.View):
         self.game.sell_house(current_player.id, pos)
         tile = self.game.board[pos]
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
         deadline_ts = int(time.time()) + 90
 
@@ -529,17 +788,23 @@ class TurnView(discord.ui.View):
 
         self.game.record_activity()
         await interaction.response.defer()
-        buf = render_board_image(self.game)
-        visual_file = discord.File(buf, filename="monopoly_board.png")
-        deadline_ts = int(time.time()) + 90
-
-        action_text = "💳 **Bail Paid:** Escaped Border Control! You are now free to roll."
-        financial_text = f"💰 **Financial Summary:** Cash Balance: **${self.game.players[current_player.id]['money']}**"
-        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
-
+        
+        # Lightweight update — token position and board appearance remain unchanged on bail
         self.setup_buttons()
         self.reset_timer()
-        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
+        deadline_ts = int(time.time()) + 90
+        
+        action_text = "💳 **Bail Paid:** Escaped Border Control! You are now free to roll."
+        financial_text = f"💰 **Financial Summary:** Cash Balance: **${self.game.players[current_player.id]['money']}**"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn — Roll the dice! (⏱️ Expires <t:{deadline_ts}:R>)"
+        
+        if self.message:
+            try:
+                await self.message.edit(content=f"{action_text}\n{financial_text}\n{status_text}", view=self)
+            except Exception:
+                pass
+        else:
+            await interaction.channel.send(content=f"{action_text}\n{financial_text}\n{status_text}", view=self)
 
     async def doubles_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -553,11 +818,11 @@ class TurnView(discord.ui.View):
         deadline_ts = int(time.time()) + 90
 
         if escaped:
-            buf = render_board_movement_animation(self.game, current_player.id, 10, self.game.players[current_player.id]["position"])
-            visual_file = discord.File(buf, filename="monopoly_move.gif")
+            anim_buf = await asyncio.to_thread(render_board_movement_animation, self.game, current_player.id, 10, self.game.players[current_player.id]["position"])
+            visual_file = discord.File(anim_buf, filename="monopoly_move.gif")
             action_text = f"🎲 **DOUBLES ROLLED [{d1}, {d2}]!** Escaped Border Control and moved forward!"
         else:
-            buf = render_board_image(self.game)
+            buf = await asyncio.to_thread(render_board_image, self.game)
             visual_file = discord.File(buf, filename="monopoly_board.png")
             action_text = f"🎲 Rolled **[{d1}, {d2}]** (No doubles). Remain held in Border Control."
 
@@ -578,18 +843,24 @@ class TurnView(discord.ui.View):
         self.game.record_activity()
         await interaction.response.defer()
         self.game.use_jail_card(current_player.id)
-        buf = render_board_image(self.game)
-        visual_file = discord.File(buf, filename="monopoly_board.png")
-        deadline_ts = int(time.time()) + 90
 
+        # Lightweight update — token position and board appearance remain unchanged
+        self.setup_buttons()
+        self.reset_timer()
+        deadline_ts = int(time.time()) + 90
+        
         action_text = "🎟️ **Diplomatic Pass Used:** Diplomatic immunity granted! You are now free to roll."
         player_state = self.game.get_player_state(current_player.id)
         financial_text = f"💰 **Financial Summary:** Cash Balance: **${player_state['money']}**"
-        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn (⏱️ Expires <t:{deadline_ts}:R>)"
+        status_text = f"⏳ **Turn Status:** **{current_player.display_name}**'s turn — Roll the dice! (⏱️ Expires <t:{deadline_ts}:R>)"
 
-        self.setup_buttons()
-        self.reset_timer()
-        await self.send_turn_bundle(interaction.channel, visual_file, action_text, financial_text, status_text)
+        if self.message:
+            try:
+                await self.message.edit(content=f"{action_text}\n{financial_text}\n{status_text}", view=self)
+            except Exception:
+                pass
+        else:
+            await interaction.channel.send(content=f"{action_text}\n{financial_text}\n{status_text}", view=self)
 
     async def bankruptcy_callback(self, interaction: discord.Interaction):
         current_player = self.game.get_current_player()
@@ -617,7 +888,7 @@ class TurnView(discord.ui.View):
         next_player = self.game.get_current_player()
         deadline_ts = int(time.time()) + 90
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
 
         action_text = f"💥 **Bankruptcy Declared:** **{current_player.display_name}** has surrendered all assets and was eliminated!"
@@ -645,11 +916,19 @@ class TurnView(discord.ui.View):
         next_player = self.game.get_current_player()
         deadline_ts = int(time.time()) + 90
 
-        buf = render_board_image(self.game)
+        buf = await asyncio.to_thread(render_board_image, self.game)
         visual_file = discord.File(buf, filename="monopoly_board.png")
 
+        event_announcement = ""
+        if getattr(self.game, "_just_triggered_event", None):
+            ev = self.game._just_triggered_event
+            event_announcement = f"\n🌍 **NEW WORLD EVENT:** {ev['title']} — {ev['description']}!"
+        elif getattr(self.game, "_just_expired_event", None):
+            exp = self.game._just_expired_event
+            event_announcement = f"\n📰 **World Event Expired:** {exp['title']} has concluded."
+
         action_text = (
-            f"⏩ **Turn Ended:** **{current_player.display_name}** finished their turn.\n"
+            f"⏩ **Turn Ended:** **{current_player.display_name}** finished their turn.{event_announcement}\n"
             f"🎲 **It is now {next_player.mention}'s turn!**"
         )
         financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(self.game)}"
@@ -712,7 +991,7 @@ async def launch_monopoly_game(channel, players: list[discord.Member]):
     deadline_ts = int(time.time()) + 90
 
     view = TurnView(game, channel.id)
-    buf = render_board_image(game)
+    buf = await asyncio.to_thread(render_board_image, game)
     visual_file = discord.File(buf, filename="monopoly_board.png")
 
     action_text = (
@@ -933,7 +1212,7 @@ async def trade(ctx, target: discord.Member, *, trade_details: str = ""):
         f"{chr(10).join(offer_desc) if offer_desc else '• Nothing'}\n\n"
         f"📥 **Requested from {target.display_name}:**\n"
         f"{chr(10).join(req_desc) if req_desc else '• Nothing'}\n\n"
-        f"{target.mention}, click **Accept Deal** or **Decline Deal** below within 90 seconds!"
+        f"{target.mention}, click **Accept Deal**, **Counter-Offer**, or **Decline Deal** below within 90 seconds!"
     )
     msg = await ctx.send(content=proposal_text, view=view)
     view.message = msg
@@ -1131,7 +1410,7 @@ async def board(ctx):
         await ctx.send("There is no active Monopoly game in this channel!")
         return
     game = active_games[ctx.channel.id]
-    buf = render_board_image(game)
+    buf = await asyncio.to_thread(render_board_image, game)
     file = discord.File(buf, filename="monopoly_board.png")
     await ctx.send(content="📋 **Live Monopoly Board:**", file=file)
 
@@ -1211,5 +1490,3 @@ async def on_command_error(ctx, error):
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
