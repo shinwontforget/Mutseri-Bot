@@ -1,6 +1,9 @@
 # Environment & Secrets (CRITICAL - DO NOT COMMIT)
 .env
 *.env
+*.key
+sendgrid.txt
+*.txt
 
 # Virtual Environment
 .venv/
@@ -13,16 +16,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Temporary / Generated Media Files
+sample_board.png
+sample_move.gif
+*.tmp
+
 # IDE & System Files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Large / Temporary / Unrelated test files
+# Large / Temporary files
 *.pdf
-scratch/
-
-# Discloud (not in use — using Render instead)
-discloud.config
 *.zip
+scratch/
