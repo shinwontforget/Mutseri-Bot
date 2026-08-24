@@ -668,6 +668,133 @@ def get_prefix(bot, message):
 bot = commands.Bot(command_prefix=get_prefix, case_insensitive=True, intents=intents, help_command=None)
 
 active_games = {}
+pending_lobbies = {}
+
+async def launch_monopoly_game(channel, players: list[discord.Member]):
+    """Initializes and launches a new active Monopoly match with board rendering and player scorecards."""
+    board = generate_random_country_board()
+    game = MonopolyGame(players, board=board)
+    active_games[channel.id] = game
+
+    # Apply daily bonus cash buffers to starting balances if claimed
+    for p in players:
+        st = get_player_stats(p.id, p.display_name)
+        if st.get("bonus_cash", 0) > 0:
+            game.players[p.id]["money"] += st["bonus_cash"]
+            st["bonus_cash"] = 0
+
+    first_player = game.get_current_player()
+    player_mentions = ", ".join(p.mention for p in players)
+    deadline_ts = int(time.time()) + 90
+
+    view = TurnView(game, channel.id)
+    buf = render_board_image(game)
+    visual_file = discord.File(buf, filename="monopoly_board.png")
+
+    action_text = (
+        f"🌍 **Mutseri's World Monopoly Started!**\n"
+        f"A unique randomized world board has been generated!\n"
+        f"**Players:** {player_mentions}\n\n"
+        f"🎲 **{first_player.mention}** goes first!"
+    )
+    financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(game)}"
+    status_text = f"⏳ **Turn Status:** **{first_player.display_name}**'s turn! (⏱️ Expires <t:{deadline_ts}:R>)"
+
+    await view.send_turn_bundle(channel, visual_file, action_text, financial_text, status_text)
+
+
+class MatchLobbyView(discord.ui.View):
+    def __init__(self, host: discord.Member, opponents: list[discord.Member], channel_id: int):
+        super().__init__(timeout=60.0)  # 60-second lobby response limit
+        self.host = host
+        self.opponents = opponents
+        self.all_players = [host] + opponents
+        self.channel_id = channel_id
+        self.accepted_ids = {host.id}
+        self.message: discord.Message | None = None
+
+    def build_lobby_text(self) -> str:
+        lines = [f"• {self.host.mention} 👑 **Host** (Ready)"]
+        for opp in self.opponents:
+            if opp.id in self.accepted_ids:
+                lines.append(f"• {opp.mention} ✅ **Accepted**")
+            else:
+                lines.append(f"• {opp.mention} ⏳ *Waiting for response...*")
+
+        count = len(self.accepted_ids)
+        total = len(self.all_players)
+        return (
+            f"🎲 **Monopoly Match Invitation** (⏱️ 60s limit)\n"
+            f"**Host:** {self.host.mention} has challenged you to a game of World Monopoly!\n\n"
+            f"👥 **Players ({count}/{total} ready):**\n"
+            + "\n".join(lines) + "\n\n"
+            f"*All invited opponents must click **Accept Match** below to start!*"
+        )
+
+    def disable_all_items(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def on_timeout(self):
+        if self.channel_id in pending_lobbies and pending_lobbies.get(self.channel_id) == self:
+            del pending_lobbies[self.channel_id]
+        self.disable_all_items()
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⏱️ **Match Invitation Expired (60s)**. Not all players accepted in time.",
+                    view=self
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="⚔️ Accept Match", style=discord.ButtonStyle.green, custom_id="lobby_accept")
+    async def accept_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in [p.id for p in self.all_players]:
+            await interaction.response.send_message("You were not invited to this match!", ephemeral=True)
+            return
+
+        if interaction.user.id in self.accepted_ids:
+            await interaction.response.send_message("You have already accepted this match!", ephemeral=True)
+            return
+
+        self.accepted_ids.add(interaction.user.id)
+
+        # Check if all players have accepted
+        if len(self.accepted_ids) == len(self.all_players):
+            if self.channel_id in pending_lobbies:
+                del pending_lobbies[self.channel_id]
+            self.disable_all_items()
+            self.stop()
+            await interaction.response.edit_message(
+                content=f"🎉 **All players accepted!** Initializing Monopoly match...\n\n{self.build_lobby_text()}",
+                view=self
+            )
+            channel = bot.get_channel(self.channel_id)
+            if channel:
+                await launch_monopoly_game(channel, self.all_players)
+        else:
+            await interaction.response.edit_message(content=self.build_lobby_text(), view=self)
+
+    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.red, custom_id="lobby_decline")
+    async def decline_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in [p.id for p in self.all_players]:
+            await interaction.response.send_message("You are not part of this match invite!", ephemeral=True)
+            return
+
+        if self.channel_id in pending_lobbies:
+            del pending_lobbies[self.channel_id]
+
+        self.disable_all_items()
+        self.stop()
+
+        if interaction.user.id == self.host.id:
+            msg = f"🛑 **Match Cancelled:** The match invitation was cancelled by host {self.host.mention}."
+        else:
+            msg = f"❌ **Match Declined:** {interaction.user.mention} declined the match invitation. Game cancelled."
+
+        await interaction.response.edit_message(content=msg, view=self)
+
 
 @bot.event
 async def on_ready():
@@ -681,6 +808,10 @@ MAX_FREE_PLAYERS = 4
 async def start_monopoly(ctx, *opponents: discord.Member):
     if ctx.channel.id in active_games:
         await ctx.send("A game is already running in this channel!")
+        return
+
+    if ctx.channel.id in pending_lobbies:
+        await ctx.send("A match invitation is already waiting for player responses in this channel! Please accept, decline, or wait for it to expire.")
         return
 
     if not opponents:
@@ -709,35 +840,10 @@ async def start_monopoly(ctx, *opponents: discord.Member):
         await ctx.send(f"Free games support up to {MAX_FREE_PLAYERS} players!")
         return
 
-    board = generate_random_country_board()
-    game = MonopolyGame(players, board=board)
-    active_games[ctx.channel.id] = game
-
-    # Apply daily bonus cash buffers to starting balances if claimed
-    for p in players:
-        st = get_player_stats(p.id, p.display_name)
-        if st.get("bonus_cash", 0) > 0:
-            game.players[p.id]["money"] += st["bonus_cash"]
-            st["bonus_cash"] = 0
-
-    first_player = game.get_current_player()
-    player_mentions = ", ".join(p.mention for p in players)
-    deadline_ts = int(time.time()) + 90
-
-    view = TurnView(game, ctx.channel.id)
-    buf = render_board_image(game)
-    visual_file = discord.File(buf, filename="monopoly_board.png")
-
-    action_text = (
-        f"🌍 **Mutseri's World Monopoly Started!**\n"
-        f"A unique randomized world board has been generated!\n"
-        f"**Players:** {player_mentions}\n\n"
-        f"🎲 **{first_player.mention}** goes first!"
-    )
-    financial_text = f"💰 **Player Balances:**\n{format_scorecard_lines(game)}"
-    status_text = f"⏳ **Turn Status:** **{first_player.display_name}**'s turn! (⏱️ Expires <t:{deadline_ts}:R>)"
-
-    await view.send_turn_bundle(ctx.channel, visual_file, action_text, financial_text, status_text)
+    lobby_view = MatchLobbyView(ctx.author, unique_opponents, ctx.channel.id)
+    pending_lobbies[ctx.channel.id] = lobby_view
+    msg = await ctx.send(content=lobby_view.build_lobby_text(), view=lobby_view)
+    lobby_view.message = msg
 
 @bot.command(name="trade", aliases=["t"])
 async def trade(ctx, target: discord.Member, *, trade_details: str = ""):
@@ -981,13 +1087,19 @@ async def set_token(ctx, emoji: str):
 
 @bot.command(name="end_monopoly", aliases=["em", "end", "stop"])
 async def end_monopoly(ctx):
+    if ctx.channel.id in pending_lobbies:
+        lobby = pending_lobbies.pop(ctx.channel.id)
+        lobby.stop()
+        await ctx.send("🛑 The pending match invitation in this channel has been cancelled.")
+        return
+
     if ctx.channel.id in active_games:
         game = active_games.pop(ctx.channel.id)
         if hasattr(game, "current_view") and game.current_view:
             game.current_view.stop()
         await ctx.send("🛑 The Monopoly game in this channel has been ended.")
     else:
-        await ctx.send("There is no active Monopoly game in this channel.")
+        await ctx.send("There is no active Monopoly game or match invitation in this channel.")
 
 @bot.command(name="board", aliases=["b"])
 async def board(ctx):
