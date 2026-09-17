@@ -999,9 +999,10 @@ async def on_ready():
 
 
 def main():
-    token = os.getenv("DISCORD_BOT_TOKEN")
+    load_dotenv()
+    token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
     if not token:
-        logger.error("DISCORD_BOT_TOKEN environment variable not found.")
+        logger.error("Neither DISCORD_BOT_TOKEN nor DISCORD_TOKEN environment variable was found.")
         return
     bot.run(token)
 
