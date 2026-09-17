@@ -1,692 +1,341 @@
+"""
+game.py - Core Game Logic Engine for Territory Wars (20-Tile Redesign)
+
+Replaces all legacy Monopoly rules (rent, houses, jail, tax, mortgages)
+with Territory Wars mechanics:
+- 20-tile loop
+- Geographic properties & stats
+- Territory conquer duels
+- Proximity Gamble window (1 tile before Dead Zones)
+- TCG cards (hand limit 5)
+- Strike Pardons ($500, $1000, $2000...)
+- Elimination at 3 strikes
+- Turn cap (40 rounds) with tie-breakers
+"""
+
 import random
-from countries import TIER_BUDGET, TIER_MID_LOW, TIER_MID_HIGH, TIER_PREMIUM
-from cards import get_fresh_chance_deck, get_fresh_treasury_deck
+from territories import BOARD_TILES, DEAD_ZONE_POSITIONS, PRE_DEAD_ZONE_POSITIONS, NEUTRAL_POSITIONS, PROPERTY_POSITIONS, get_tile
+from tcg_cards import generate_random_card
 
-HOUSE_PRICES = {
-    "brown": 50,
-    "light_blue": 50,
-    "pink": 100,
-    "orange": 100,
-    "red": 150,
-    "yellow": 150,
-    "green": 200,
-    "dark_blue": 200,
-}
+START_PASS_BONUS = 200
+START_PROP_DIVIDEND = 100
+MAX_HAND_LIMIT = 5
+MAX_STRIKES = 3
+DEFAULT_TURN_CAP = 40  # 40 rounds across players
 
-# World event system configuration
-WORLD_EVENT_INTERVAL = 9   # trigger every N total turns across all players
-WORLD_EVENT_DURATION = 3   # each event lasts this many turns
+class TerritoryWarsGame:
+    def __init__(self, players: list, turn_order_override: list = None):
+        """
+        Initializes a new game of Territory Wars.
+        `players`: list of discord Member / User objects.
+        """
+        ordered_players = turn_order_override if turn_order_override else list(players)
+        self.player_list = ordered_players
+        self.board = BOARD_TILES
 
-# Available world events pool
-WORLD_EVENTS = [
-    {
-        "id": "recession",
-        "title": "🌩️ Global Recession",
-        "description": "Economic downturn — all property rents are halved this round!",
-        "rent_multiplier": 0.5,
-        "color_group": None,
-    },
-    {
-        "id": "tourism_boom",
-        "title": "🌅 Tourism Boom",
-        "description": "A spike in international tourism — rent doubled on one color group!",
-        "rent_multiplier": 2.0,
-        "color_group": "__random__",  # resolved at trigger time
-    },
-    {
-        "id": "free_trade_zone",
-        "title": "🤝 Free Trade Zone",
-        "description": "International trade agreement — no property taxes collected this round!",
-        "rent_multiplier": 1.0,
-        "color_group": None,
-    },
-    {
-        "id": "infrastructure_boom",
-        "title": "🏗️ Infrastructure Boom",
-        "description": "Global construction surge — rent on all utilities and airports doubled!",
-        "rent_multiplier": 2.0,
-        "color_group": "__transport__",  # special tag for railroads + utilities
-    },
-    {
-        "id": "sanctions",
-        "title": "🚫 International Sanctions",
-        "description": "Geopolitical tensions — rent on premium properties halved!",
-        "rent_multiplier": 0.5,
-        "color_group": "__random__",  # resolved at trigger time
-    },
-]
-
-
-def _make_city_tile(country, city_index, color, price, rent):
-    """Create a single city property tile from a country's city list."""
-    c = country
-    city = c["cities"][city_index]
-    return {
-        "name": f"{c['flag']} {city}, {c['name']} (#{c['rank']})",
-        "type": "property",
-        "color": color,
-        "price": price,
-        "rent": rent,  # [base, 1 house, 2 houses, 3 houses, 4 houses, skyscraper]
-        "country_rank": c["rank"],
-        "country": c["name"],
-        "city": city,
-        "houses": 0,
-        "is_mortgaged": False,
-        "house_price": HOUSE_PRICES.get(color, 100)
-    }
-
-def generate_random_country_board():
-    """Generates a symmetric 40-tile World Edition Monopoly board."""
-    budget_pair   = random.sample(TIER_BUDGET,   2)
-    mid_low_pair  = random.sample(TIER_MID_LOW,  2)
-    mid_high_pair = random.sample(TIER_MID_HIGH, 2)
-    premium_pair  = random.sample(TIER_PREMIUM,  2)
-
-    b1, b2     = budget_pair
-    ml1, ml2   = mid_low_pair
-    mh1, mh2   = mid_high_pair
-    p1, p2     = premium_pair
-
-    board = [
-        # CORNER 0
-        {"name": "🛫 START / GO", "type": "go"},
-
-        # PATH 1 — Budget (Top Row — Red Headers)
-        _make_city_tile(b1, 0, "red",        60,  [2,  10,  30,  90,  160,  250]),
-        {"name": "🏦 World Treasury",            "type": "community_chest"},
-        _make_city_tile(b1, 1, "red",        60,  [4,  20,  60, 180,  320,  450]),
-        {"name": "📉 Budget Import Duty",        "type": "tax", "amount": 75},
-        {"name": "✈️ JFK International Airport", "type": "railroad", "price": 200, "is_mortgaged": False},
-        _make_city_tile(b2, 0, "red",       100, [6,  30,  90, 270,  400,  550]),
-        {"name": "🌐 Global News Event",         "type": "chance"},
-        _make_city_tile(b2, 1, "red",       120, [8,  40, 100, 300,  450,  600]),
-        {"name": "⚡ Global Solar Grid",         "type": "utility", "price": 150, "is_mortgaged": False},
-
-        # CORNER 10
-        {"name": "🛂 Customs Clearance / Border Control", "type": "jail"},
-
-        # PATH 2 — Mid-Low (Right Column — Green Headers)
-        _make_city_tile(ml1, 0, "green",   140, [10,  50, 150, 450,  625,  750]),
-        {"name": "🏦 World Treasury",           "type": "community_chest"},
-        _make_city_tile(ml1, 1, "green",   160, [12,  60, 180, 500,  700,  900]),
-        {"name": "🧾 Regional Business Tax",    "type": "tax", "amount": 125},
-        {"name": "✈️ Heathrow Airport",         "type": "railroad", "price": 200, "is_mortgaged": False},
-        _make_city_tile(ml2, 0, "green", 180, [14,  70, 200, 550,  750,  950]),
-        {"name": "🌐 Global News Event",        "type": "chance"},
-        _make_city_tile(ml2, 1, "green", 200, [16,  80, 220, 600,  800, 1000]),
-        {"name": "📡 Satellite Telecom Network","type": "utility", "price": 150, "is_mortgaged": False},
-
-        # CORNER 20
-        {"name": "🏝️ International Waters", "type": "free_parking"},
-
-        # PATH 3 — Mid-High (Bottom Row — Light Blue Headers)
-        _make_city_tile(mh1, 0, "light_blue", 220, [18,  90, 250, 700,  875, 1050]),
-        {"name": "🏦 World Treasury",          "type": "community_chest"},
-        _make_city_tile(mh1, 1, "light_blue", 240, [20, 100, 300, 750,  925, 1100]),
-        {"name": "💼 Corporate Travel Tax",    "type": "tax", "amount": 175},
-        {"name": "✈️ Haneda Airport",          "type": "railroad", "price": 200, "is_mortgaged": False},
-        _make_city_tile(mh2, 0, "light_blue", 260, [22, 110, 330, 800,  975, 1150]),
-        {"name": "🌐 Global News Event",       "type": "chance"},
-        _make_city_tile(mh2, 1, "light_blue", 280, [24, 120, 360, 850, 1025, 1200]),
-        {"name": "☢️ Nuclear Energy Grid",     "type": "utility", "price": 200, "is_mortgaged": False},
-
-        # CORNER 30
-        {"name": "🚨 Deportation / Border Violation", "type": "go_to_jail"},
-
-        # PATH 4 — Premium (Left Column — Pink Headers)
-        _make_city_tile(p1, 0, "pink",     300, [26, 130, 390,  900, 1100, 1275]),
-        {"name": "🏦 World Treasury",             "type": "community_chest"},
-        _make_city_tile(p1, 1, "pink",     320, [28, 150, 450, 1000, 1200, 1400]),
-        {"name": "📈 Luxury Tariff",              "type": "tax", "amount": 250},
-        {"name": "✈️ Dubai International Airport","type": "railroad", "price": 200, "is_mortgaged": False},
-        _make_city_tile(p2, 0, "pink", 350, [35, 175, 500, 1100, 1300, 1500]),
-        {"name": "🌐 Global News Event",          "type": "chance"},
-        _make_city_tile(p2, 1, "pink", 400, [50, 200, 600, 1400, 1700, 2000]),
-        {"name": "🛰️ Global Satellite Hub",      "type": "utility", "price": 200, "is_mortgaged": False},
-    ]
-
-    return board
-
-class MonopolyGame:
-    def __init__(self, players, board=None):
-        self.board = board if board is not None else generate_random_country_board()
-        self.players = {
-            player.id: {
-                "member": player,
-                "money": 1500, 
+        self.players = {}
+        for p in self.player_list:
+            # Each player starts with $1000 and 1 random card
+            starting_card = generate_random_card()
+            self.players[p.id] = {
+                "member": p,
+                "money": 1000,
                 "position": 0,
-                "in_jail": False,
-                "jail_turns": 0,
-                "has_jail_card": 0,
-                "properties": [],
+                "strikes": 0,
+                "cards": [starting_card],
+                "properties": [],  # list of tile indices
+                "pardon_count": 0,
+                "is_eliminated": False,
                 "has_rolled": False,
-                "bankrupt": False
-            } for player in players
-        }
-        self.turn_index = 0
-        self.turn_count = 1
-        self.player_list = players
-        self.properties_owned = {} # pos -> player_id
-        self.log = []
-        self.turn_message_history = []  # list of {"turn": int, "messages": list[discord.Message]}
-        self.chance_deck = get_fresh_chance_deck()
-        self.treasury_deck = get_fresh_treasury_deck()
-        self.consecutive_inactive_turns = 0
+            }
 
-        # Static board render cache (board_renderer.py uses this)
+        self.properties_owned = {}  # pos -> player_id
+        self.turn_index = 0
+        self.round_count = 1
+        self.total_turns_taken = 0
+        self.log = []
+        self.turn_message_history = []
+
+        # Proximity Gamble cooldown tracking
+        self.last_gamble_challenger_id = None
+        self.last_gamble_turn = -99
+
+        # Static board rendering cache
         self._static_board_cache = None
         self._static_board_cache_key = None
-
-        # World event system
-        self.active_event = None          # dict or None: {id, title, description, rent_multiplier, color_group, turns_remaining}
-        self.total_turns_elapsed = 0      # incremented in next_turn()
-        self._last_event_turn = 0         # turn at which the last event was triggered
-        self._just_triggered_event = None # set for one turn so bot.py can announce it
-        self._just_expired_event = None   # set for one turn so bot.py can announce expiry
-
-    def record_activity(self):
-        """Resets the consecutive inactive turns counter when any player takes an action."""
-        self.consecutive_inactive_turns = 0
-
-    def get_current_player(self):
-        # Skip bankrupt players
-        active_count = sum(1 for p in self.player_list if not self.players[p.id]["bankrupt"])
-        if active_count == 0:
-            return self.player_list[0]
-        
-        while self.players[self.player_list[self.turn_index].id]["bankrupt"]:
-            self.turn_index = (self.turn_index + 1) % len(self.player_list)
-            
-        return self.player_list[self.turn_index]
-        
-    def get_player_state(self, player_id):
-        return self.players[player_id]
-
-    def log_event(self, message):
-        self.log.append(message)
-
-    def next_turn(self):
-        current_player_id = self.get_current_player().id
-        self.players[current_player_id]["has_rolled"] = False
-        self.turn_index = (self.turn_index + 1) % len(self.player_list)
-        self.turn_count += 1
-        self.total_turns_elapsed += 1
-        # Advance to next active non-bankrupt player
-        self.get_current_player()
-        # Check and tick world events
-        self._tick_world_event()
-
-    def _tick_world_event(self):
-        """Ticks down active event duration and potentially triggers a new one."""
-        self._just_triggered_event = None
-        self._just_expired_event = None
-
-        # Tick down active event
-        if self.active_event is not None:
-            self.active_event["turns_remaining"] -= 1
-            if self.active_event["turns_remaining"] <= 0:
-                self._just_expired_event = self.active_event
-                self.active_event = None
-                self.log_event(f"📰 World Event **{self._just_expired_event['title']}** has ended.")
-
-        # Trigger a new event if interval reached and none active
-        if (
-            self.active_event is None
-            and self.total_turns_elapsed > 0
-            and self.total_turns_elapsed % WORLD_EVENT_INTERVAL == 0
-        ):
-            self._trigger_world_event()
-
-    def _trigger_world_event(self):
-        """Picks a random world event and activates it."""
-        color_groups = list({
-            t.get("color") for t in self.board
-            if t.get("color") and t["type"] == "property"
-        })
-
-        event_template = random.choice(WORLD_EVENTS)
-        event = dict(event_template)  # shallow copy so we can mutate color_group safely
-
-        # Resolve dynamic color group
-        if event["color_group"] == "__random__" and color_groups:
-            event["color_group"] = random.choice(color_groups)
-            event["description"] = (
-                event["description"].rstrip("!")
-                + f" ({event['color_group'].replace('_', ' ').title()} properties)!"
-            )
-
-        event["turns_remaining"] = WORLD_EVENT_DURATION
-        self.active_event = event
-        self._just_triggered_event = event
-        self.log_event(
-            f"🌍 **WORLD EVENT:** {event['title']} — {event['description']} "
-            f"(Lasts {WORLD_EVENT_DURATION} turns)"
-        )
 
     def invalidate_static_cache(self):
-        """Call after any change that affects static board visuals (ownership, mortgage)."""
+        """Invalidates the cached static board layer when ownership changes."""
         self._static_board_cache = None
         self._static_board_cache_key = None
 
-    def roll_dice(self):
-        return random.randint(1, 6), random.randint(1, 6)
+    def log_event(self, msg: str):
+        self.log.append(msg)
 
-    def move_player(self, player_id, steps) -> tuple[int, int]:
-        player = self.players[player_id]
-        if player["in_jail"] or player["bankrupt"]:
-            return player["position"], player["position"]
+    def get_player_state(self, player_id: int) -> dict:
+        return self.players.get(player_id)
 
-        old_pos = player["position"]
-        new_pos = (old_pos + steps) % 40
-        player["position"] = new_pos
+    def get_active_players(self) -> list:
+        """Returns list of players who are not eliminated."""
+        return [p for p in self.player_list if not self.players[p.id]["is_eliminated"]]
 
-        if new_pos == 0:
-            # Landed exactly on START — collect double salary
-            player["money"] += 400
-            self.log_event(f"🛫 {player['member'].display_name} landed exactly on START and collected $400!")
-        elif new_pos < old_pos:
-            # Passed through START — collect standard salary
-            player["money"] += 200
-            self.log_event(f"🛫 {player['member'].display_name} passed START and collected $200.")
+    def get_current_player(self):
+        """Returns the current active player whose turn it is."""
+        active = self.get_active_players()
+        if not active:
+            return self.player_list[0]
 
-        self.log_event(f"{player['member'].display_name} moved to {self.board[new_pos]['name']}.")
-        landing_result = self.handle_landing(player_id, new_pos)
-        return old_pos, new_pos
+        # Advance until we find a non-eliminated player
+        while self.players[self.player_list[self.turn_index].id]["is_eliminated"]:
+            self.turn_index = (self.turn_index + 1) % len(self.player_list)
 
-    def handle_landing(self, player_id, pos) -> dict:
+        return self.player_list[self.turn_index]
+
+    def roll_dice(self) -> int:
+        """Rolls a single 6-sided die (1-6)."""
+        return random.randint(1, 6)
+
+    def add_card_to_player(self, player_id: int) -> tuple[dict, bool]:
         """
-        Processes landing on a tile and returns a structured result dict.
-
-        Returns:
-            dict with keys:
-              - "type": the tile type string
-              - "auto_resolved": True if no player decision is needed
-              - "needs_buy_prompt": True if player should be offered a Buy button
-              - "needs_auction": True if player should be offered Buy + Decline/Auction
-              - "rent_paid": int rent amount if rent was paid (else 0)
-              - "tax_paid": int tax amount if tax was paid (else 0)
+        Awards 1 random TCG card to the player.
+        Returns (card, needs_discard).
+        If cards count > MAX_HAND_LIMIT, needs_discard is True.
         """
-        tile = self.board[pos]
-        player = self.players[player_id]
-        result = {
-            "type": tile["type"],
-            "auto_resolved": True,
-            "needs_buy_prompt": False,
-            "needs_auction": False,
-            "rent_paid": 0,
-            "tax_paid": 0,
+        card = generate_random_card()
+        st = self.players[player_id]
+        st["cards"].append(card)
+        needs_discard = len(st["cards"]) > MAX_HAND_LIMIT
+        return card, needs_discard
+
+    def remove_card_from_player(self, player_id: int, card_id: str) -> bool:
+        """Removes a specific card from the player's hand (e.g. discard or played)."""
+        st = self.players[player_id]
+        for i, c in enumerate(st["cards"]):
+            if c["id"] == card_id:
+                st["cards"].pop(i)
+                return True
+        return False
+
+    def move_player(self, player_id: int, steps: int) -> dict:
+        """
+        Advances player by `steps` tiles.
+        Calculates START pass bonus ($200 + 1 card + $100/property).
+        Returns a dict summarizing the move.
+        """
+        st = self.players[player_id]
+        old_pos = st["position"]
+        new_pos = (old_pos + steps) % len(self.board)
+        st["position"] = new_pos
+
+        # Check if passed or landed on START (tile 0)
+        passed_start = (old_pos + steps) >= len(self.board)
+        start_payout = 0
+        drawn_card = None
+        needs_discard = False
+
+        if passed_start:
+            num_props = len(st["properties"])
+            start_payout = START_PASS_BONUS + (START_PROP_DIVIDEND * num_props)
+            st["money"] += start_payout
+            drawn_card, needs_discard = self.add_card_to_player(player_id)
+            self.log_event(
+                f"🚩 **{st['member'].display_name}** passed START! Received **+${start_payout}** "
+                f"(${START_PASS_BONUS} + ${START_PROP_DIVIDEND}x{num_props} properties) and drawn TCG Card: `{drawn_card['title']}`."
+            )
+
+        tile = get_tile(new_pos)
+
+        # Check if landed on pre-dead zone (triggers Proximity Gamble window)
+        is_pre_dead_zone = new_pos in PRE_DEAD_ZONE_POSITIONS
+
+        return {
+            "old_pos": old_pos,
+            "new_pos": new_pos,
+            "steps": steps,
+            "passed_start": passed_start,
+            "start_payout": start_payout,
+            "drawn_card": drawn_card,
+            "needs_discard": needs_discard,
+            "tile": tile,
+            "is_pre_dead_zone": is_pre_dead_zone
         }
 
-        if tile["type"] == "tax":
-            # Free trade zone event suppresses tax
-            if self.active_event and self.active_event["id"] == "free_trade_zone":
-                self.log_event(
-                    f"🤝 Free Trade Zone: {player['member'].display_name} is exempt from "
-                    f"{tile['name']} (${tile['amount']}) this round!"
-                )
-            else:
-                player["money"] -= tile["amount"]
-                result["tax_paid"] = tile["amount"]
-                self.log_event(
-                    f"{player['member'].display_name} paid {tile['name']} of ${tile['amount']}."
-                )
+    def add_strike(self, player_id: int) -> tuple[int, bool]:
+        """
+        Adds 1 strike to player.
+        If strikes reach 3, eliminates the player and returns all owned properties to unowned pool.
+        Returns (strikes_count, is_now_eliminated).
+        """
+        st = self.players[player_id]
+        st["strikes"] += 1
+        eliminated = False
 
-        elif tile["type"] == "go_to_jail":
-            player["position"] = 10
-            player["in_jail"] = True
-            player["jail_turns"] = 0
-            self.log_event(f"{player['member'].display_name} was held at Border Control!")
-
-        elif tile["type"] == "chance":
-            self.draw_and_execute_card(player_id, "chance")
-
-        elif tile["type"] == "community_chest":
-            self.draw_and_execute_card(player_id, "treasury")
-
-        elif tile["type"] in ["property", "railroad", "utility"]:
-            if pos in self.properties_owned:
-                owner_id = self.properties_owned[pos]
-                if owner_id != player_id and not self.board[pos].get("is_mortgaged", False):
-                    rent = self.calculate_rent(pos)
-                    player["money"] -= rent
-                    self.players[owner_id]["money"] += rent
-                    result["rent_paid"] = rent
-                    self.log_event(
-                        f"{player['member'].display_name} paid ${rent} rent to "
-                        f"{self.players[owner_id]['member'].display_name}."
-                    )
-                elif self.board[pos].get("is_mortgaged", False):
-                    self.log_event(f"{tile['name']} is mortgaged. No rent collected!")
-                # Own property — trivially resolved, no action needed
-            else:
-                # Unowned — player decision required
-                result["auto_resolved"] = False
-                result["needs_buy_prompt"] = True
-                result["needs_auction"] = True
-                self.log_event(
-                    f"{tile['name']} is unowned. {player['member'].display_name} "
-                    f"can buy it for ${tile['price']}."
-                )
-
-        # All other tile types (go, jail/visiting, free_parking) are trivially resolved
-        return result
-
-    # --- Card Actions ---
-    def draw_and_execute_card(self, player_id, deck_type: str) -> dict:
-        player = self.players[player_id]
-        card = self.chance_deck.draw_card() if deck_type == "chance" else self.treasury_deck.draw_card()
-        action = card["action"]
-        
-        self.log_event(f"🎴 {player['member'].display_name} drew: {card['title']} — {card['description']}")
-        
-        if action == "money":
-            player["money"] += card["amount"]
-        elif action == "go_to_jail":
-            player["position"] = 10
-            player["in_jail"] = True
-            player["jail_turns"] = 0
-        elif action == "jail_free":
-            player["has_jail_card"] += 1
-        elif action == "move_to":
-            old_pos = player["position"]
-            target = card["target"]
-            if card.get("pass_go", False) and target < old_pos:
-                player["money"] += 200
-                self.log_event(f"{player['member'].display_name} passed START and collected $200.")
-            player["position"] = target
-            self.handle_landing(player_id, target)
-        elif action == "move_relative":
-            new_pos = (player["position"] + card["steps"]) % 40
-            player["position"] = new_pos
-            self.handle_landing(player_id, new_pos)
-        elif action == "move_to_nearest":
-            pos = player["position"]
-            airports = [5, 15, 25, 35]
-            target = min(airports, key=lambda a: (a - pos) % 40)
-            if target < pos:
-                player["money"] += 200
-            player["position"] = target
-            self.handle_landing(player_id, target)
-        elif action == "collect_from_players":
-            amt = card["amount"]
-            for pid, pdata in self.players.items():
-                if pid != player_id and not pdata["bankrupt"]:
-                    pdata["money"] -= amt
-                    player["money"] += amt
-        elif action == "repairs":
-            total_houses = sum(self.board[p].get("houses", 0) for p in player["properties"] if self.board[p].get("houses", 0) < 5)
-            total_skyscrapers = sum(1 for p in player["properties"] if self.board[p].get("houses", 0) == 5)
-            cost = (total_houses * card["house_cost"]) + (total_skyscrapers * card["skyscraper_cost"])
-            player["money"] -= cost
-            if cost > 0:
-                self.log_event(f"{player['member'].display_name} paid ${cost} in property repairs.")
-
-        return card
-
-    # --- Monopolies, Houses & Mortgages ---
-    def has_monopoly(self, player_id, color: str) -> bool:
-        color_tiles = [i for i, t in enumerate(self.board) if t.get("color") == color]
-        if not color_tiles:
-            return False
-        return all(self.properties_owned.get(pos) == player_id for pos in color_tiles)
-
-    def calculate_rent(self, pos) -> int:
-        tile = self.board[pos]
-        if tile.get("is_mortgaged", False):
-            return 0
-            
-        t_type = tile["type"]
-        base_rent = 0
-
-        if t_type == "property":
-            houses = tile.get("houses", 0)
-            owner_id = self.properties_owned.get(pos)
-            if houses > 0:
-                base_rent = tile["rent"][houses]
-            elif owner_id and self.has_monopoly(owner_id, tile["color"]):
-                base_rent = tile["rent"][0] * 2
-            else:
-                base_rent = tile["rent"][0]
-        elif t_type == "railroad":
-            owner_id = self.properties_owned[pos]
-            owner = self.players[owner_id]
-            count = sum(
-                1 for p in owner["properties"]
-                if self.board[p]["type"] == "railroad" and not self.board[p].get("is_mortgaged", False)
-            )
-            base_rent = 25 * (2 ** (count - 1)) if count > 0 else 25
-        elif t_type == "utility":
-            base_rent = 20
-
-        if base_rent == 0:
-            return 0
-
-        # Apply active world event modifier
-        if self.active_event:
-            ev = self.active_event
-            ev_id = ev["id"]
-            color_group = ev.get("color_group")
-
-            if ev_id == "recession":
-                # All rents halved
-                base_rent = max(1, int(base_rent * ev["rent_multiplier"]))
-
-            elif ev_id == "tourism_boom" and color_group:
-                # Rent doubled only on the specified color group
-                if t_type == "property" and tile.get("color") == color_group:
-                    base_rent = int(base_rent * ev["rent_multiplier"])
-
-            elif ev_id == "infrastructure_boom":
-                # Rent doubled on railroads and utilities
-                if t_type in ("railroad", "utility"):
-                    base_rent = int(base_rent * ev["rent_multiplier"])
-
-            elif ev_id == "sanctions" and color_group:
-                # Rent halved on the specified color group
-                if t_type == "property" and tile.get("color") == color_group:
-                    base_rent = max(1, int(base_rent * ev["rent_multiplier"]))
-
-        return base_rent
-
-    def build_house(self, player_id, pos) -> bool:
-        tile = self.board[pos]
-        player = self.players[player_id]
-        if (
-            tile["type"] == "property"
-            and self.properties_owned.get(pos) == player_id
-            and self.has_monopoly(player_id, tile["color"])
-            and tile["houses"] < 5
-            and player["money"] >= tile["house_price"]
-        ):
-            player["money"] -= tile["house_price"]
-            tile["houses"] += 1
-            h_label = "Skyscraper" if tile["houses"] == 5 else f"House #{tile['houses']}"
-            self.log_event(f"🏗️ {player['member'].display_name} built a {h_label} on {tile['name']} for ${tile['house_price']}.")
-            return True
-        return False
-
-    def sell_house(self, player_id, pos) -> bool:
-        tile = self.board[pos]
-        player = self.players[player_id]
-        if tile["type"] == "property" and self.properties_owned.get(pos) == player_id and tile["houses"] > 0:
-            refund = tile["house_price"] // 2
-            tile["houses"] -= 1
-            player["money"] += refund
-            self.log_event(f"🏷️ {player['member'].display_name} sold a house on {tile['name']} for ${refund}.")
-            return True
-        return False
-
-    def mortgage_property(self, player_id, pos) -> bool:
-        tile = self.board[pos]
-        player = self.players[player_id]
-        if (
-            self.properties_owned.get(pos) == player_id
-            and not tile.get("is_mortgaged", False)
-            and tile.get("houses", 0) == 0
-        ):
-            mortgage_val = tile["price"] // 2
-            tile["is_mortgaged"] = True
-            player["money"] += mortgage_val
-            self.invalidate_static_cache()
-            self.log_event(f"🏦 {player['member'].display_name} mortgaged {tile['name']} for ${mortgage_val}.")
-            return True
-        return False
-
-    def unmortgage_property(self, player_id, pos) -> bool:
-        tile = self.board[pos]
-        player = self.players[player_id]
-        cost = int((tile["price"] // 2) * 1.10)
-        if (
-            self.properties_owned.get(pos) == player_id
-            and tile.get("is_mortgaged", False)
-            and player["money"] >= cost
-        ):
-            tile["is_mortgaged"] = False
-            player["money"] -= cost
-            self.invalidate_static_cache()
-            self.log_event(f"🏦 {player['member'].display_name} unmortgaged {tile['name']} for ${cost}.")
-            return True
-        return False
-
-    def buy_property(self, player_id, pos) -> bool:
-        tile = self.board[pos]
-        player = self.players[player_id]
-        if pos not in self.properties_owned and player["money"] >= tile["price"]:
-            player["money"] -= tile["price"]
-            self.properties_owned[pos] = player_id
-            player["properties"].append(pos)
-            self.invalidate_static_cache()
-            self.log_event(f"{player['member'].display_name} bought {tile['name']} for ${tile['price']}.")
-            return True
-        return False
-
-    # --- Jail Mechanics ---
-    def pay_jail_bail(self, player_id) -> bool:
-        player = self.players[player_id]
-        if player["in_jail"] and player["money"] >= 50:
-            player["money"] -= 50
-            player["in_jail"] = False
-            player["jail_turns"] = 0
-            self.log_event(f"💳 {player['member'].display_name} paid $50 bail to exit Border Control!")
-            return True
-        return False
-
-    def attempt_jail_doubles(self, player_id) -> tuple[int, int, bool]:
-        player = self.players[player_id]
-        d1, d2 = self.roll_dice()
-        if d1 == d2:
-            player["in_jail"] = False
-            player["jail_turns"] = 0
-            self.log_event(f"🎲 {player['member'].display_name} rolled DOUBLES ({d1}, {d2}) and escaped Border Control!")
-            self.move_player(player_id, d1 + d2)
-            player["has_rolled"] = True
-            return d1, d2, True
-        else:
-            player["jail_turns"] += 1
-            self.log_event(f"🎲 {player['member'].display_name} rolled {d1} and {d2} (No doubles). Stays in Border Control.")
-            player["has_rolled"] = True
-            return d1, d2, False
-
-    def use_jail_card(self, player_id) -> bool:
-        player = self.players[player_id]
-        if player["in_jail"] and player["has_jail_card"] > 0:
-            player["has_jail_card"] -= 1
-            player["in_jail"] = False
-            player["jail_turns"] = 0
-            self.log_event(f"🎟️ {player['member'].display_name} used a Diplomatic Pass to escape Border Control!")
-            return True
-        return False
-
-    # --- Bankruptcy Safety Net ---
-    def get_player_net_worth(self, player_id) -> int:
-        player = self.players[player_id]
-        total = player["money"]
-        for pos in player["properties"]:
-            tile = self.board[pos]
-            if not tile.get("is_mortgaged", False):
-                total += tile["price"] // 2
-            houses = tile.get("houses", 0)
-            if houses > 0:
-                total += houses * (tile["house_price"] // 2)
-        return total
-
-    def declare_bankruptcy(self, player_id, creditor_id=None):
-        player = self.players[player_id]
-        player["bankrupt"] = True
-        player["money"] = 0
-        
-        # Surrender properties
-        for pos in list(player["properties"]):
-            if creditor_id and creditor_id in self.players:
-                self.properties_owned[pos] = creditor_id
-                self.players[creditor_id]["properties"].append(pos)
-            else:
+        if st["strikes"] >= MAX_STRIKES:
+            st["is_eliminated"] = True
+            eliminated = True
+            # Return all owned properties to unowned
+            for pos in list(st["properties"]):
                 if pos in self.properties_owned:
                     del self.properties_owned[pos]
-                self.board[pos]["houses"] = 0
-                self.board[pos]["is_mortgaged"] = False
-                
-        player["properties"] = []
+            st["properties"].clear()
+            self.invalidate_static_cache()
+            self.log_event(f"💀 **{st['member'].display_name}** accumulated 3 STRIKES and has been ELIMINATED! All their territories are released!")
+
+        return st["strikes"], eliminated
+
+    def get_pardon_cost(self, player_id: int) -> int:
+        """Returns the current strike pardon cost for the player: 500 * (2 ** count)."""
+        count = self.players[player_id]["pardon_count"]
+        return 500 * (2 ** count)
+
+    def can_pardon_strike(self, player_id: int) -> tuple[bool, str]:
+        """Checks if a player can pay for a strike pardon."""
+        st = self.players[player_id]
+        if st["strikes"] <= 0:
+            return False, "You have 0 strikes to pardon."
+        cost = self.get_pardon_cost(player_id)
+        if st["money"] < cost:
+            return False, f"Insufficient funds! A pardon costs **${cost}**, but you only have **${st['money']}**."
+        return True, ""
+
+    def pardon_strike(self, player_id: int) -> tuple[bool, int, int]:
+        """
+        Pardons 1 strike.
+        Deducts money, decreases strikes, doubles next cost.
+        Returns (success, new_strikes, next_cost).
+        """
+        can, reason = self.can_pardon_strike(player_id)
+        if not can:
+            return False, 0, 0
+
+        st = self.players[player_id]
+        cost = self.get_pardon_cost(player_id)
+        st["money"] -= cost
+        st["strikes"] = max(0, st["strikes"] - 1)
+        st["pardon_count"] += 1
+        next_cost = self.get_pardon_cost(player_id)
+
+        self.log_event(f"🏥 **{st['member'].display_name}** purchased a Strike Pardon for **${cost}**! (Remaining strikes: {st['strikes']}, next pardon: ${next_cost})")
+        return True, st["strikes"], next_cost
+
+    def buy_property(self, player_id: int, pos: int) -> bool:
+        """Purchases an unowned property at fixed price."""
+        st = self.players[player_id]
+        tile = get_tile(pos)
+        price = tile.get("price", 250)
+
+        if pos in self.properties_owned:
+            return False
+        if st["money"] < price:
+            return False
+
+        st["money"] -= price
+        st["properties"].append(pos)
+        self.properties_owned[pos] = player_id
         self.invalidate_static_cache()
-        creditor_name = self.players[creditor_id]["member"].display_name if creditor_id else "the Bank"
-        self.log_event(f"💥 {player['member'].display_name} declared BANKRUPTCY and surrendered assets to {creditor_name}!")
+        self.log_event(f"🏛️ **{st['member'].display_name}** bought **{tile['name']}, {tile['country']}** for **${price}**.")
+        return True
 
-    def get_unowned_properties(self) -> list[dict]:
-        """Returns all unowned buyable tiles (properties, railroads, utilities)."""
-        unowned = []
-        for pos, tile in enumerate(self.board):
-            if tile["type"] in ["property", "railroad", "utility"] and pos not in self.properties_owned:
-                unowned.append({"pos": pos, **tile})
-        return unowned
+    def transfer_property(self, from_player_id: int, to_player_id: int, pos: int):
+        """Transfers ownership of a property from one player to another (e.g. duel win)."""
+        tile = get_tile(pos)
+        from_st = self.players.get(from_player_id)
+        to_st = self.players.get(to_player_id)
 
-    def get_player_properties_detail(self, player_id: int) -> list[dict]:
-        """Returns structured details of all properties owned by player_id."""
-        player = self.players.get(player_id)
-        if not player:
-            return []
-        details = []
-        for pos in player["properties"]:
-            tile = self.board[pos]
-            rent = self.calculate_rent(pos)
-            has_mono = self.has_monopoly(player_id, tile.get("color", "")) if tile.get("color") else False
-            details.append({
-                "pos": pos,
-                "name": tile["name"],
-                "city": tile.get("city", ""),
-                "country": tile.get("country", ""),
-                "type": tile["type"],
-                "color": tile.get("color", ""),
-                "price": tile.get("price", 0),
-                "houses": tile.get("houses", 0),
-                "is_mortgaged": tile.get("is_mortgaged", False),
-                "rent": rent,
-                "has_monopoly": has_mono
-            })
-        return details
+        if from_st and pos in from_st["properties"]:
+            from_st["properties"].remove(pos)
 
-    def find_property_by_name(self, query: str, player_id: int | None = None) -> int | None:
-        """Finds a property position by city name, country, full name, or tile number (1-39)."""
-        q = query.strip().lower()
-        if q.isdigit():
-            pos = int(q)
-            if 0 <= pos < 40 and self.board[pos]["type"] in ["property", "railroad", "utility"]:
-                if player_id is None or pos in self.players[player_id]["properties"]:
-                    return pos
+        if to_st and pos not in to_st["properties"]:
+            to_st["properties"].append(pos)
 
-        candidates = []
-        for pos, tile in enumerate(self.board):
-            if tile["type"] not in ["property", "railroad", "utility"]:
-                continue
-            if player_id is not None and pos not in self.players[player_id]["properties"]:
-                continue
+        self.properties_owned[pos] = to_player_id
+        self.invalidate_static_cache()
+        self.log_event(f"🚩 Ownership of **{tile['name']}** transferred to **{to_st['member'].display_name}**!")
 
-            city = tile.get("city", "").lower()
-            country = tile.get("country", "").lower()
-            name = tile.get("name", "").lower()
+    def can_initiate_gamble(self, challenger_id: int, exposed_player_id: int) -> tuple[bool, str]:
+        """
+        Checks if challenger can challenge the exposed player:
+        - Must not be the exposed player
+        - Challenger must not be eliminated
+        - Challenger cannot initiate a gamble two turns in a row
+        """
+        if challenger_id == exposed_player_id:
+            return False, "You cannot challenge yourself!"
 
-            if q == city or q == country or q == name:
-                return pos
-            if q in city or q in country or q in name:
-                candidates.append(pos)
+        ch_st = self.players[challenger_id]
+        if ch_st["is_eliminated"]:
+            return False, "Eliminated players cannot initiate gambles."
 
-        return candidates[0] if candidates else None
+        # Anti-farming: cannot challenge two turns in a row
+        if self.last_gamble_challenger_id == challenger_id and (self.total_turns_taken - self.last_gamble_turn) <= 1:
+            return False, "You cannot initiate a Proximity Gamble two turns in a row!"
+
+        return True, ""
+
+    def record_gamble_attempt(self, challenger_id: int):
+        """Records gamble challenge to enforce anti-farming cooldown."""
+        self.last_gamble_challenger_id = challenger_id
+        self.last_gamble_turn = self.total_turns_taken
+
+    def check_game_over(self) -> tuple[bool, dict | None]:
+        """
+        Checks if the game has ended:
+        1. Only 1 active player remains -> that player wins!
+        2. Turn cap (40 rounds) reached -> ranked by fewest strikes, then properties owned, then money.
+        """
+        active = self.get_active_players()
+        if len(active) == 1:
+            winner = active[0]
+            return True, {
+                "winner": winner,
+                "reason": f"Last commander standing! All rival players were eliminated.",
+                "rankings": [winner]
+            }
+        elif len(active) == 0:
+            # Tie / all eliminated simultaneously
+            return True, {
+                "winner": self.player_list[0],
+                "reason": "All players were eliminated.",
+                "rankings": self.player_list
+            }
+
+        # Check turn cap
+        if self.round_count > DEFAULT_TURN_CAP:
+            # Sort active players by fewest strikes -> most properties -> most money
+            def rank_key(p):
+                st = self.players[p.id]
+                return (
+                    st["strikes"],            # Ascending (fewer strikes is better)
+                    -len(st["properties"]),   # Descending (more properties is better)
+                    -st["money"]              # Descending (more money is better)
+                )
+
+            ranked = sorted(active, key=rank_key)
+            winner = ranked[0]
+            w_st = self.players[winner.id]
+            return True, {
+                "winner": winner,
+                "reason": (
+                    f"Turn limit ({DEFAULT_TURN_CAP} rounds) reached!\n"
+                    f"**{winner.display_name}** wins with **{w_st['strikes']} strikes**, "
+                    f"**{len(w_st['properties'])} properties**, and **${w_st['money']}**!"
+                ),
+                "rankings": ranked
+            }
+
+        return False, None
+
+    def next_turn(self):
+        """Advances turn to next active player."""
+        current = self.get_current_player()
+        self.players[current.id]["has_rolled"] = False
+
+        self.turn_index = (self.turn_index + 1) % len(self.player_list)
+        self.total_turns_taken += 1
+
+        # Check if full round completed
+        if self.turn_index == 0:
+            self.round_count += 1
+
+        # Advance past any eliminated player
+        self.get_current_player()

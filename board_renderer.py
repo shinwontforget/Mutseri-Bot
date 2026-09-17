@@ -1,425 +1,467 @@
+"""
+board_renderer.py - High-Fidelity 20-Tile Board Renderer for Territory Wars
+
+Features:
+- Clean 6x6 perimeter layout (20 tiles: 4 corners + 4 inner tiles per side)
+- Modern dark matte aesthetic matching the provided reference image
+- High-contrast card surfaces:
+    * START corner (glowing cyan neon frame)
+    * DEAD ZONE corners (hazard stripes + warning triangle)
+    * NEUTRAL / DRAW cards (sleek slate deck cards)
+    * PROPERTY cards (clean card surface, color banner, Climate/Terrain/Economy stats)
+- Center Scorecard Panel displaying:
+    * Player color badge
+    * Player name & cash
+    * Territory count (e.g. 3/14)
+    * Real-time 3-circle strike indicators (unfilled vs filled red)
+- Dynamic ownership highlights with owner badges (P1, P2, P3, P4)
+- Multi-layer glowing player tokens with collision offsets
+- Static layer caching (composite dynamic elements on top)
+- Asynchronous non-blocking rendering via loop.run_in_executor
+"""
+
 import os
 import io
+import math
+import asyncio
 from PIL import Image, ImageDraw, ImageFont
+from territories import BOARD_TILES, DEAD_ZONE_POSITIONS, NEUTRAL_POSITIONS, PROPERTY_POSITIONS
 
-COLOR_HEX_MAP = {
-    "brown": "#8B4513",
-    "light_blue": "#38BDF8",
-    "pink": "#F472B6",
-    "orange": "#FB923C",
-    "red": "#EF4444",
-    "yellow": "#FACC15",
-    "green": "#22C55E",
-    "dark_blue": "#1D4ED8",
-}
-
-from stats_db import get_player_stats
-
+# Player neon color schemes
 PLAYER_NEON_SCHEMES = [
-    {"rgb": (255, 0, 85),   "hex": "#FF0055", "label": "P1"},  # Neon Pink/Red
-    {"rgb": (0, 240, 255),  "hex": "#00F0FF", "label": "P2"},  # Neon Cyan
-    {"rgb": (57, 255, 20),  "hex": "#39FF14", "label": "P3"},  # Neon Green
-    {"rgb": (255, 230, 0),  "hex": "#FFE600", "label": "P4"},  # Neon Gold
+    {"rgb": (0, 240, 255),   "hex": "#00F0FF", "label": "P1", "name": "Cyan"},    # P1 Neon Cyan
+    {"rgb": (34, 197, 94),   "hex": "#22C55E", "label": "P2", "name": "Green"},   # P2 Emerald Green
+    {"rgb": (249, 115, 22),  "hex": "#F97316", "label": "P3", "name": "Orange"},  # P3 Vibrant Orange
+    {"rgb": (168, 85, 247),  "hex": "#A855F7", "label": "P4", "name": "Purple"},  # P4 Neon Purple
 ]
 
-TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "board_template.png")
+CANVAS_SIZE = 1200  # 1200 x 1200 high-res board
 
-def get_font(size=14, bold=False):
-    font_candidates = [
+def get_font(size: int = 14, bold: bool = False):
+    """Returns a TrueType font with fallbacks for Windows and Linux."""
+    candidates = [
+        "segoeuib.ttf" if bold else "segoeui.ttf",
         "arialbd.ttf" if bold else "arial.ttf",
+        "calibrib.ttf" if bold else "calibri.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
     ]
-    for font_name in font_candidates:
+    for font_name in candidates:
         try:
             return ImageFont.truetype(font_name, size)
-        except IOError:
+        except (IOError, OSError):
             continue
     return ImageFont.load_default()
 
-def get_tile_bounds(pos: int, W: int, H: int) -> tuple[int, int, int, int]:
-    # Exact board grid alignment for clean board_template.png
-    margin_x_left = int(0.140 * W)
-    margin_x_right = int(0.860 * W)
-    margin_y_top = int(0.145 * H)
-    margin_y_bottom = int(0.855 * H)
+def get_tile_rect(pos: int, W: int, H: int) -> tuple[int, int, int, int]:
+    """
+    Returns (x1, y1, x2, y2) bounds for a given tile position (0 to 19).
+    Board has 6 tiles per side:
+      Corner 0: (0, 0)
+      Tiles 1-4: Top Row (step 1 to 4)
+      Corner 5: (5, 0)
+      Tiles 6-9: Right Column (step 1 to 4)
+      Corner 10: (5, 5)
+      Tiles 11-14: Bottom Row (step 1 to 4)
+      Corner 15: (0, 5)
+      Tiles 16-19: Left Column (step 1 to 4)
+    """
+    pad = int(W * 0.030)
+    board_w = W - 2 * pad
+    board_h = H - 2 * pad
 
-    tile_w = (margin_x_right - margin_x_left) / 9.0
-    tile_h = (margin_y_bottom - margin_y_top) / 9.0
+    # Grid size: 6 cells
+    corner_size = int(board_w * 0.170)
+    inner_w = (board_w - 2 * corner_size) / 4.0
+    inner_h = (board_h - 2 * corner_size) / 4.0
+
+    # Margins
+    left = pad
+    right = pad + board_w
+    top = pad
+    bottom = pad + board_h
 
     if pos == 0:  # Top-Left START
-        return (0, 0, margin_x_left, margin_y_top)
-    elif pos == 10:  # Top-Right JAIL
-        return (margin_x_right, 0, W, margin_y_top)
-    elif pos == 20:  # Bottom-Right VACATION
-        return (margin_x_right, margin_y_bottom, W, H)
-    elif pos == 30:  # Bottom-Left GO TO JAIL
-        return (0, margin_y_bottom, margin_x_left, H)
-    elif 1 <= pos <= 9:  # Top Row (left to right, pos 1 next to START, pos 9 next to JAIL)
-        step = pos - 1
-        x1 = int(margin_x_left + step * tile_w)
-        x2 = int(x1 + tile_w)
-        return (x1, int(0.015 * H), x2, margin_y_top)
-    elif 11 <= pos <= 19:  # Right Column (top to bottom, pos 11 below JAIL, pos 19 above VACATION)
-        step = pos - 11
-        y1 = int(margin_y_top + step * tile_h)
-        y2 = int(y1 + tile_h)
-        return (margin_x_right, y1, int(0.985 * W), y2)
-    elif 21 <= pos <= 29:  # Bottom Row (right to left, pos 21 next to VACATION, pos 29 next to GO TO JAIL)
-        step = pos - 21
-        x2 = int(margin_x_right - step * tile_w)
-        x1 = int(x2 - tile_w)
-        return (x1, margin_y_bottom, x2, int(0.985 * H))
-    elif 31 <= pos <= 39:  # Left Column (bottom to top, pos 31 above GO TO JAIL, pos 39 below START)
-        step = pos - 31
-        y2 = int(margin_y_bottom - step * tile_h)
-        y1 = int(y2 - tile_h)
-        return (int(0.015 * W), y1, margin_x_left, y2)
+        return (left, top, left + corner_size, top + corner_size)
+    elif 1 <= pos <= 4:  # Top edge
+        idx = pos - 1
+        x1 = int(left + corner_size + idx * inner_w)
+        x2 = int(x1 + inner_w)
+        return (x1, top, x2, top + corner_size)
+    elif pos == 5:  # Top-Right DEAD ZONE 1
+        return (right - corner_size, top, right, top + corner_size)
+    elif 6 <= pos <= 9:  # Right edge
+        idx = pos - 6
+        y1 = int(top + corner_size + idx * inner_h)
+        y2 = int(y1 + inner_h)
+        return (right - corner_size, y1, right, y2)
+    elif pos == 10:  # Bottom-Right NEUTRAL 1
+        return (right - corner_size, bottom - corner_size, right, bottom)
+    elif 11 <= pos <= 14:  # Bottom edge (right to left)
+        idx = pos - 11
+        x2 = int(right - corner_size - idx * inner_w)
+        x1 = int(x2 - inner_w)
+        return (x1, bottom - corner_size, x2, bottom)
+    elif pos == 15:  # Bottom-Left DEAD ZONE 2
+        return (left, bottom - corner_size, left + corner_size, bottom)
+    elif 16 <= pos <= 19:  # Left edge (bottom to top)
+        idx = pos - 16
+        y2 = int(bottom - corner_size - idx * inner_h)
+        y1 = int(y2 - inner_h)
+        return (left, y1, left + corner_size, y2)
+
     raise ValueError(f"Invalid position {pos}")
 
 
 # ---------------------------------------------------------------------------
-# Static layer — tile labels and prices only (no ownership, no houses)
-# Cached on game._static_board_cache keyed by game._static_board_cache_key.
+# Helper Drawing Functions
 # ---------------------------------------------------------------------------
+def draw_rounded_card(draw: ImageDraw.Draw, rect: tuple[int, int, int, int], radius: int, fill: tuple, outline: tuple = None, width: int = 1):
+    """Draws a rounded rectangle card."""
+    x1, y1, x2, y2 = rect
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=fill, outline=outline, width=width)
 
-def _compute_cache_key(game) -> frozenset:
-    """Returns a hashable key representing ownership + mortgage state."""
-    ownership_items = frozenset(game.properties_owned.items())
-    mortgage_items = frozenset(
-        (pos, game.board[pos].get("is_mortgaged", False))
-        for pos in game.properties_owned
-    )
-    return frozenset([("ownership", ownership_items), ("mortgage", mortgage_items)])
+def draw_hazard_stripes(draw: ImageDraw.Draw, rect: tuple[int, int, int, int], radius: int):
+    """Draws diagonal hazard warning stripes on the border of Dead Zones."""
+    x1, y1, x2, y2 = rect
+    # Base dark red fill
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=(40, 15, 20, 255), outline=(220, 38, 38, 255), width=3)
+
+    # Hazard stripe lines along the border perimeter
+    stripe_w = 6
+    for offset in range(-50, (x2 - x1) + (y2 - y1) + 50, 16):
+        # Draw clipped lines near border
+        sx1 = x1 + offset
+        sy1 = y1 + 3
+        sx2 = sx1 - 18
+        sy2 = y1 + 14
+        if x1 <= sx1 <= x2:
+            draw.line([(sx1, sy1), (sx2, sy2)], fill=(220, 38, 38, 200), width=stripe_w)
+        # Bottom edge
+        by1 = y2 - 14
+        by2 = y2 - 3
+        if x1 <= sx1 <= x2:
+            draw.line([(sx1, by1), (sx2, by2)], fill=(220, 38, 38, 200), width=stripe_w)
 
 
+# ---------------------------------------------------------------------------
+# Static Board Layer (Cached)
+# ---------------------------------------------------------------------------
 def render_static_board(game) -> Image.Image:
     """
-    Renders (or returns cached) the static board layer:
-    tile outlines from the template + text labels + prices (no owner tints,
-    no house indicators — those are dynamic and composited on top each turn).
-
-    The result is cached on game._static_board_cache. The cache is keyed by
-    ownership + mortgage state (game._static_board_cache_key) and is
-    automatically invalidated whenever game.invalidate_static_cache() is called
-    (which buy_property, mortgage_property, unmortgage_property, and
-    declare_bankruptcy all do).
+    Renders the static base board:
+    - Charcoal board canvas with dark frame
+    - All 20 base tile cards:
+        * START corner (Tile 0)
+        * DEAD ZONE corners (Tiles 5, 15)
+        * NEUTRAL / DRAW cards (Tiles 7, 10, 12)
+        * PROPERTY cards (14 properties with stats & prices)
+    - Center Scorecard Panel container outline
     """
-    current_key = _compute_cache_key(game)
-
-    if (
-        game._static_board_cache is not None
-        and game._static_board_cache_key == current_key
-    ):
-        # Return a copy so callers can composite on top without corrupting cache
+    if game._static_board_cache is not None:
         return game._static_board_cache.copy()
 
-    # --- Build the static layer from scratch ---
-    if os.path.exists(TEMPLATE_PATH):
-        base_img = Image.open(TEMPLATE_PATH).convert("RGBA")
-    else:
-        base_img = Image.new("RGBA", (1200, 960), (10, 15, 29, 255))
+    W = CANVAS_SIZE
+    H = CANVAS_SIZE
+    img = Image.new("RGBA", (W, H), (22, 25, 33, 255))
+    draw = ImageDraw.Draw(img)
 
-    W, H = base_img.size
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
+    # Subtle background grid lines
+    grid_color = (30, 35, 46, 255)
+    for step in range(0, W, 40):
+        draw.line([(step, 0), (step, H)], fill=grid_color, width=1)
+        draw.line([(0, step), (W, step)], fill=grid_color, width=1)
 
-    for pos in range(40):
-        x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
-        tile = game.board[pos]
+    # Center area boundary shadow
+    draw.rounded_rectangle([int(W * 0.02), int(H * 0.02), int(W * 0.98), int(H * 0.98)], radius=24, outline=(38, 44, 58, 255), width=2)
+
+    # Fonts
+    font_lg = get_font(26, bold=True)
+    font_md = get_font(18, bold=True)
+    font_sm = get_font(14, bold=True)
+    font_xs = get_font(11, bold=True)
+    font_stat = get_font(12, bold=True)
+
+    # Draw all 20 tiles
+    for pos in range(20):
+        x1, y1, x2, y2 = get_tile_rect(pos, W, H)
+        tile = BOARD_TILES[pos]
         tile_type = tile["type"]
-        tile_w = x2 - x1
-        tile_h = y2 - y1
+        card_pad = 4
+        cx1, cy1, cx2, cy2 = x1 + card_pad, y1 + card_pad, x2 - card_pad, y2 - card_pad
+        card_w = cx2 - cx1
+        card_h = cy2 - cy1
 
-        pad = 2
-        if 1 <= pos <= 9:
-            cx1 = x1 + pad; cy1 = y1 + pad
-            cx2 = x2 - pad; cy2 = y2 - int(tile_h * 0.28)
-        elif 11 <= pos <= 19:
-            cx1 = x1 + int(tile_w * 0.28); cy1 = y1 + pad
-            cx2 = x2 - pad;                 cy2 = y2 - pad
-        elif 21 <= pos <= 29:
-            cx1 = x1 + pad;              cy1 = y1 + int(tile_h * 0.28)
-            cx2 = x2 - pad;              cy2 = y2 - pad
-        elif 31 <= pos <= 39:
-            cx1 = x1 + pad;              cy1 = y1 + pad
-            cx2 = x2 - int(tile_w * 0.28); cy2 = y2 - pad
+        if tile_type == "start":
+            # --- START Tile ---
+            draw_rounded_card(draw, (cx1, cy1, cx2, cy2), radius=16, fill=(18, 24, 34, 255), outline=(0, 229, 255, 255), width=3)
+            # Power / Start icon
+            mid_x = (cx1 + cx2) // 2
+            mid_y = cy1 + int(card_h * 0.42)
+            r_icon = 28
+            draw.ellipse([mid_x - r_icon, mid_y - r_icon, mid_x + r_icon, mid_y + r_icon], outline=(0, 229, 255, 255), width=4)
+            draw.line([(mid_x, mid_y - r_icon - 4), (mid_x, mid_y - 4)], fill=(0, 229, 255, 255), width=5)
+            # START text
+            draw.text((mid_x, cy2 - 32), "START", fill=(255, 255, 255, 255), font=font_lg, anchor="mm")
+            draw.text((mid_x, cy2 - 14), "+$200 / +1 CARD", fill=(0, 229, 255, 255), font=font_xs, anchor="mm")
+
+        elif tile_type == "dead_zone":
+            # --- DEAD ZONE Tile ---
+            draw_hazard_stripes(draw, (cx1, cy1, cx2, cy2), radius=16)
+            mid_x = (cx1 + cx2) // 2
+            mid_y = cy1 + int(card_h * 0.42)
+            # Warning Triangle
+            tri_h = 32
+            draw.polygon([
+                (mid_x, mid_y - tri_h),
+                (mid_x - 30, mid_y + 14),
+                (mid_x + 30, mid_y + 14)
+            ], outline=(239, 68, 68, 255), fill=(70, 20, 25, 255))
+            # Exclamation mark
+            draw.text((mid_x, mid_y - 4), "!", fill=(255, 255, 255, 255), font=font_lg, anchor="mm")
+            # Label
+            draw.text((mid_x, cy2 - 32), "DEAD ZONE", fill=(239, 68, 68, 255), font=font_md, anchor="mm")
+            draw.text((mid_x, cy2 - 14), "+1 STRIKE", fill=(255, 120, 120, 255), font=font_xs, anchor="mm")
+
+        elif tile_type == "neutral":
+            # --- NEUTRAL / DRAW Card ---
+            draw_rounded_card(draw, (cx1, cy1, cx2, cy2), radius=14, fill=(45, 53, 67, 255), outline=(71, 85, 105, 255), width=2)
+            mid_x = (cx1 + cx2) // 2
+            mid_y = cy1 + int(card_h * 0.42)
+            # Card deck icon (overlapping rounded boxes)
+            cw, ch = 24, 34
+            draw.rounded_rectangle([mid_x - cw - 4, mid_y - ch + 4, mid_x + cw - 12, mid_y + ch - 4], radius=4, outline=(148, 163, 184, 255), width=2)
+            draw.rounded_rectangle([mid_x - cw + 4, mid_y - ch - 4, mid_x + cw - 4, mid_y + ch - 12], radius=4, fill=(58, 68, 86, 255), outline=(226, 232, 240, 255), width=2)
+            # Label
+            draw.text((mid_x, cy2 - 28), "DRAW", fill=(226, 232, 240, 255), font=font_md, anchor="mm")
+            draw.text((mid_x, cy2 - 12), "1 TCG CARD", fill=(148, 163, 184, 255), font=font_xs, anchor="mm")
+
         else:
-            cx1, cy1, cx2, cy2 = x1, y1, x2, y2
+            # --- PROPERTY Card ---
+            # Card body: clean light card surface
+            draw_rounded_card(draw, (cx1, cy1, cx2, cy2), radius=12, fill=(244, 240, 232, 255), outline=(203, 213, 225, 255), width=1)
 
-        if pos not in (0, 10, 20, 30):
-            clean_label = ""
-            clean_label2 = ""
+            # Orientation-specific layout
+            is_top = (1 <= pos <= 4)
+            is_bottom = (11 <= pos <= 14)
+            is_left = (16 <= pos <= 19)
+            is_right = (6 <= pos <= 9)
 
-            if tile_type == "property":
-                city_name = tile.get("city", "")
-                if not city_name:
-                    raw_name = tile.get("name", "")
-                    city_name = raw_name.split(",")[0].strip()
-                city_name = "".join([c for c in city_name if ord(c) < 128 or ord(c) > 255]).strip()
-                if not city_name:
-                    city_name = tile.get("country", "CITY")
+            color_hex = tile.get("color", "#00C4FF")
+            # Parse color
+            r = int(color_hex[1:3], 16)
+            g = int(color_hex[3:5], 16)
+            b = int(color_hex[5:7], 16)
 
-                words = city_name.upper().split()
-                if len(words) == 1:
-                    clean_label = words[0]; clean_label2 = ""
-                elif len(words) == 2:
-                    clean_label = words[0]; clean_label2 = words[1]
-                else:
-                    mid = len(words) // 2
-                    clean_label = " ".join(words[:mid])
-                    clean_label2 = " ".join(words[mid:])
+            mid_x = (cx1 + cx2) // 2
 
-            elif tile_type == "community_chest":
-                clean_label = "WORLD"; clean_label2 = "TREASURY"
-            elif tile_type == "chance":
-                clean_label = "GLOBAL"; clean_label2 = "NEWS"
-            elif tile_type == "tax":
-                clean_label = "TAX"; clean_label2 = ""
-            elif tile_type == "railroad":
-                raw_name = tile.get("name", "")
-                airport_parts = [
-                    w for w in raw_name.replace("✈️", "").split()
-                    if w.lower() not in ("international", "airport")
-                ]
-                clean_label = airport_parts[0].upper() if airport_parts else "JFK"
-                clean_label2 = "AIRPORT"
-            elif tile_type == "utility":
-                raw_name = tile.get("name", "")
-                utility_parts = [
-                    w for w in raw_name.replace("⚡", "").replace("📡", "").replace("☢️", "").replace("🛰️", "").split()
-                ]
-                clean_label = utility_parts[0].upper() if utility_parts else "UTILITY"
-                clean_label2 = utility_parts[1].upper() if len(utility_parts) > 1 else ""
-            else:
-                clean_label = tile_type.upper()
+            # Banner bar (at the inner side facing board center)
+            bar_h = 10
+            if is_top:
+                draw.rectangle([cx1 + 1, cy2 - bar_h, cx2 - 1, cy2 - 1], fill=(r, g, b, 255))
+            elif is_bottom:
+                draw.rectangle([cx1 + 1, cy1 + 1, cx2 - 1, cy1 + bar_h], fill=(r, g, b, 255))
+            elif is_left:
+                draw.rectangle([cx2 - bar_h, cy1 + 1, cx2 - 1, cy2 - 1], fill=(r, g, b, 255))
+            else:  # is_right
+                draw.rectangle([cx1 + 1, cy1 + 1, cx1 + bar_h, cy2 - 1], fill=(r, g, b, 255))
 
-            box_w = cx2 - cx1
-            box_h = cy2 - cy1
-            narrow = min(box_w, box_h)
-            base_size = max(8, min(12, int(narrow * 0.20)))
-            tile_font = get_font(base_size, bold=True)
-            price_font = get_font(max(7, base_size - 2), bold=True)
-            text_x = (cx1 + cx2) // 2
+            # Property text content
+            flag = tile.get("flag", "")
+            city = tile.get("name", "")
+            country = tile.get("country", "")
+            stats = tile.get("stats", {})
+            price = tile.get("price", 250)
 
-            if tile_type == "property":
-                line_gap = base_size + 2
-                num_lines = 2 if clean_label2 else 1
-                center_y = (cy1 + cy2) // 2 - 4
-                ty1 = center_y - (line_gap * num_lines) // 2 + line_gap // 2
+            # Draw City Name and Country
+            title_y = cy1 + 22 if not is_bottom else cy1 + 28
+            draw.text((mid_x, title_y), city.upper(), fill=(15, 23, 42, 255), font=font_sm, anchor="mm")
+            draw.text((mid_x, title_y + 16), country.upper(), fill=(100, 116, 139, 255), font=font_xs, anchor="mm")
 
-                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
-                draw.text((text_x, ty1), clean_label, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
+            # Draw 3 Stat indicators: Climate, Terrain, Economy
+            stat_y = title_y + 36
+            stats_text = f"C:{stats.get('climate', 5)}  T:{stats.get('terrain', 5)}  E:{stats.get('economy', 5)}"
+            draw.text((mid_x, stat_y), stats_text, fill=(51, 65, 85, 255), font=font_stat, anchor="mm")
 
-                if clean_label2:
-                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
-                    draw.text((text_x, ty1 + line_gap), clean_label2, fill=(255, 255, 255, 255), font=tile_font, anchor="mm")
+            # Price text
+            price_y = cy2 - 20 if not is_top else cy2 - 24
+            draw.text((mid_x, price_y), f"${price}", fill=(15, 23, 42, 255), font=font_md, anchor="mm")
 
-                # Price only shown for unowned properties
-                if pos not in game.properties_owned:
-                    price = tile.get("price", 0)
-                    draw.text((text_x + 1, cy2 - base_size // 2 - 1), f"${price}", fill=(0, 0, 0, 240), font=price_font, anchor="mm")
-                    draw.text((text_x, cy2 - base_size // 2 - 2), f"${price}", fill=(0, 240, 255, 255), font=price_font, anchor="mm")
-
-            else:
-                line_gap = base_size + 2
-                num_lines = 2 if clean_label2 else 1
-                center_y = (cy1 + cy2) // 2 - 4
-                ty1 = center_y - (line_gap * num_lines) // 2 + line_gap // 2
-
-                draw.text((text_x + 1, ty1 + 1), clean_label, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
-                draw.text((text_x, ty1), clean_label, fill=(255, 235, 170, 255), font=tile_font, anchor="mm")
-
-                if clean_label2:
-                    draw.text((text_x + 1, ty1 + line_gap + 1), clean_label2, fill=(0, 0, 0, 240), font=tile_font, anchor="mm")
-                    draw.text((text_x, ty1 + line_gap), clean_label2, fill=(255, 235, 170, 255), font=tile_font, anchor="mm")
-
-                if tile_type in ("railroad", "utility") and pos not in game.properties_owned:
-                    price = tile.get("price", 0)
-                    draw.text((text_x, cy2 - base_size // 2 - 2), f"${price}", fill=(0, 240, 255, 255), font=price_font, anchor="mm")
-                elif tile_type == "tax":
-                    amount = tile.get("amount", 0)
-                    draw.text((text_x, cy2 - base_size // 2 - 2), f"-${amount}", fill=(255, 80, 80, 255), font=price_font, anchor="mm")
-
-    result = Image.alpha_composite(base_img, overlay)
-
-    # Store in cache
-    game._static_board_cache = result.copy()
-    game._static_board_cache_key = current_key
-
-    return result
+    # Store in static cache
+    game._static_board_cache = img.copy()
+    return img
 
 
 # ---------------------------------------------------------------------------
-# Dynamic layer — ownership tints, banners, house indicators, mortgaged overlays
-# Composited on top of the static layer fresh every render.
+# Dynamic Board Overlay (Ownership, Tokens, Scorecard)
 # ---------------------------------------------------------------------------
-
 def render_dynamic_overlay(base_img: Image.Image, game) -> Image.Image:
     """
-    Composites dynamic elements (owner colours, house indicators, mortgaged
-    overlays) onto *base_img* (which should be the static board layer).
-    Returns a new RGBA image with the overlay applied.
+    Composites real-time dynamic elements:
+    - Owned tile tints & badges in player colors
+    - Center Scorecard panel (Player rows, cash, territories count, strike circles)
     """
     W, H = base_img.size
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
 
-    for pos in range(40):
-        x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
-        tile = game.board[pos]
-        tile_type = tile["type"]
-        is_mortgaged = tile.get("is_mortgaged", False)
-        tile_w = x2 - x1
-        tile_h = y2 - y1
+    font_md = get_font(18, bold=True)
+    font_sm = get_font(14, bold=True)
+    font_xs = get_font(12, bold=True)
+    font_lg = get_font(22, bold=True)
 
-        pad = 2
-        banner_rect = None
-        if 1 <= pos <= 9:
-            cx1 = x1 + pad; cy1 = y1 + pad
-            cx2 = x2 - pad; cy2 = y2 - int(tile_h * 0.28)
-            banner_rect = (x1 + 1, cy2, x2 - 1, y2 - 1)
-        elif 11 <= pos <= 19:
-            cx1 = x1 + int(tile_w * 0.28); cy1 = y1 + pad
-            cx2 = x2 - pad;                 cy2 = y2 - pad
-            banner_rect = (x1 + 1, y1 + 1, cx1, y2 - 1)
-        elif 21 <= pos <= 29:
-            cx1 = x1 + pad;              cy1 = y1 + int(tile_h * 0.28)
-            cx2 = x2 - pad;              cy2 = y2 - pad
-            banner_rect = (x1 + 1, y1 + 1, x2 - 1, cy1)
-        elif 31 <= pos <= 39:
-            cx1 = x1 + pad;              cy1 = y1 + pad
-            cx2 = x2 - int(tile_w * 0.28); cy2 = y2 - pad
-            banner_rect = (cx2, y1 + 1, x2 - 1, y2 - 1)
-        else:
-            cx1, cy1, cx2, cy2 = x1, y1, x2, y2
+    # 1. Tile Ownership Highlights
+    for pos, owner_id in game.properties_owned.items():
+        x1, y1, x2, y2 = get_tile_rect(pos, W, H)
+        card_pad = 4
+        cx1, cy1, cx2, cy2 = x1 + card_pad, y1 + card_pad, x2 - card_pad, y2 - card_pad
 
-        # ---- Owner tints + banner ----
-        if pos in game.properties_owned:
-            owner_id = game.properties_owned[pos]
-            owner_idx = next((i for i, p in enumerate(game.player_list) if p.id == owner_id), 0)
-            scheme = PLAYER_NEON_SCHEMES[owner_idx % len(PLAYER_NEON_SCHEMES)]
-            r, g, b = scheme["rgb"]
+        # Find owner index
+        owner_idx = next((i for i, p in enumerate(game.player_list) if p.id == owner_id), 0)
+        scheme = PLAYER_NEON_SCHEMES[owner_idx % len(PLAYER_NEON_SCHEMES)]
+        r, g, b = scheme["rgb"]
 
-            if banner_rect and tile_type == "property":
-                bx1, by1, bx2, by2 = banner_rect
-                draw.rectangle([bx1, by1, bx2, by2], fill=(r, g, b, 235))
-                draw.rectangle([bx1, by1, bx2, by2], outline=(255, 255, 255, 180), width=1)
+        # Neon glow border & overlay
+        draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=12, fill=(r, g, b, 45), outline=(r, g, b, 255), width=3)
 
-            draw.rectangle([cx1, cy1, cx2, cy2], fill=(r, g, b, 50))
-            draw.rectangle([cx1 - 1, cy1 - 1, cx2 + 1, cy2 + 1], outline=(r, g, b, 120), width=3)
-            draw.rectangle([cx1, cy1, cx2, cy2], outline=(r, g, b, 255), width=2)
+        # Owner badge
+        draw.rounded_rectangle([cx1 + 4, cy1 + 4, cx1 + 32, cy1 + 22], radius=4, fill=(r, g, b, 240))
+        draw.text((cx1 + 18, cy1 + 13), scheme["label"], fill=(0, 0, 0, 255), font=font_xs, anchor="mm")
 
-            badge_font = get_font(max(8, int(min(tile_w, tile_h) * 0.14)), bold=True)
-            draw.rectangle([cx1 + 2, cy1 + 2, cx1 + 18, cy1 + 12], fill=(r, g, b, 240))
-            draw.text((cx1 + 10, cy1 + 7), scheme["label"], fill=(0, 0, 0, 255), font=badge_font, anchor="mm")
+    # 2. Center Scorecard Panel (matching reference mockup)
+    sc_w = int(W * 0.46)
+    sc_h = int(H * 0.38)
+    sc_x1 = (W - sc_w) // 2
+    sc_y1 = (H - sc_h) // 2
+    sc_x2 = sc_x1 + sc_w
+    sc_y2 = sc_y1 + sc_h
 
-        if pos not in (0, 10, 20, 30):
-            base_size = max(8, min(12, int(min(x2 - x1, y2 - y1) * 0.20)))
-            price_font = get_font(max(7, base_size - 2), bold=True)
-            text_x = (cx1 + cx2) // 2
+    # Container background with subtle border
+    draw.rounded_rectangle([sc_x1, sc_y1, sc_x2, sc_y2], radius=18, fill=(30, 36, 48, 245), outline=(55, 65, 81, 255), width=2)
 
-            # ---- Mortgaged overlay ----
-            if is_mortgaged:
-                draw.rectangle(
-                    [cx1 + 2, (cy1 + cy2) // 2 - 8, cx2 - 2, (cy1 + cy2) // 2 + 8],
-                    fill=(220, 20, 40, 200)
-                )
-                draw.text(
-                    (text_x, (cy1 + cy2) // 2), "MORTGAGED",
-                    fill=(255, 255, 255, 255), font=price_font, anchor="mm"
-                )
+    # Panel header with title & window control dots
+    draw.text((sc_x1 + 24, sc_y1 + 22), "TERRITORY WARS", fill=(148, 163, 184, 255), font=font_xs, anchor="lm")
+    draw.ellipse([sc_x2 - 38, sc_y1 + 16, sc_x2 - 28, sc_y1 + 26], fill=(71, 85, 105, 255))
+    draw.ellipse([sc_x2 - 24, sc_y1 + 16, sc_x2 - 14, sc_y1 + 26], fill=(71, 85, 105, 255))
 
-            # ---- House / skyscraper indicator ----
-            houses = tile.get("houses", 0)
-            if houses > 0:
-                h_text = "SKY" if houses == 5 else f"{houses}H"
-                hw, hh = 24, 12
-                draw.rectangle([cx2 - hw - 2, cy1 + 2, cx2 - 2, cy1 + hh + 2], fill=(0, 220, 130, 240))
-                draw.text(
-                    (cx2 - hw // 2 - 2, cy1 + hh // 2 + 2), h_text,
-                    fill=(0, 0, 0, 255), font=font_tiny, anchor="mm"
-                )
+    # Divider line
+    draw.line([(sc_x1 + 16, sc_y1 + 38), (sc_x2 - 16, sc_y1 + 38)], fill=(45, 55, 72, 255), width=1)
+
+    # Player Rows
+    row_start_y = sc_y1 + 50
+    row_h = (sc_h - 65) // max(len(game.player_list), 1)
+
+    for i, p in enumerate(game.player_list):
+        st = game.get_player_state(p.id)
+        scheme = PLAYER_NEON_SCHEMES[i % len(PLAYER_NEON_SCHEMES)]
+        r, g, b = scheme["rgb"]
+
+        ry1 = row_start_y + i * row_h
+        ry2 = ry1 + row_h - 8
+        rx1 = sc_x1 + 16
+        rx2 = sc_x2 - 16
+
+        # Row box
+        is_elim = st.get("is_eliminated", False)
+        row_bg = (20, 24, 33, 200) if not is_elim else (28, 18, 22, 200)
+        draw.rounded_rectangle([rx1, ry1, rx2, ry2], radius=8, fill=row_bg)
+
+        mid_ry = (ry1 + ry2) // 2
+
+        # Color chip badge
+        chip_w = 26
+        chip_h = 20
+        chip_x = rx1 + 12
+        draw.rounded_rectangle([chip_x, mid_ry - chip_h // 2, chip_x + chip_w, mid_ry + chip_h // 2], radius=4, fill=(r, g, b, 255))
+        draw.text((chip_x + chip_w // 2, mid_ry), scheme["label"], fill=(0, 0, 0, 255), font=font_xs, anchor="mm")
+
+        # Player Name
+        name_x = chip_x + chip_w + 12
+        name = p.display_name[:14]
+        name_color = (255, 255, 255, 255) if not is_elim else (148, 163, 184, 255)
+        draw.text((name_x, mid_ry), name, fill=name_color, font=font_sm, anchor="lm")
+
+        # Cash & Properties
+        num_props = len(st.get("properties", []))
+        stats_str = f"${st['money']} | {num_props}/14" if not is_elim else "ELIMINATED"
+        draw.text((rx2 - 110, mid_ry), stats_str, fill=(203, 213, 225, 255), font=font_xs, anchor="rm")
+
+        # 3 Strike Indicators (Circles on right)
+        strikes = st.get("strikes", 0)
+        circle_start_x = rx2 - 75
+        r_circ = 9
+        for s_idx in range(3):
+            cx = circle_start_x + s_idx * 22
+            cy = mid_ry
+            if s_idx < strikes:
+                # Filled Red Strike Indicator
+                draw.ellipse([cx - r_circ, cy - r_circ, cx + r_circ, cy + r_circ], fill=(239, 68, 68, 255), outline=(255, 255, 255, 255), width=1)
+                draw.line([(cx - 4, cy - 4), (cx + 4, cy + 4)], fill=(255, 255, 255, 255), width=2)
+                draw.line([(cx - 4, cy + 4), (cx + 4, cy - 4)], fill=(255, 255, 255, 255), width=2)
+            else:
+                # Unfilled Neutral Circle
+                draw.ellipse([cx - r_circ, cy - r_circ, cx + r_circ, cy + r_circ], fill=(30, 36, 48, 255), outline=(100, 116, 139, 255), width=2)
 
     return Image.alpha_composite(base_img, overlay)
 
 
 # ---------------------------------------------------------------------------
-# Public API — signatures unchanged from the original file
+# Player Tokens Drawing
 # ---------------------------------------------------------------------------
-
-def render_board_base(game) -> Image.Image:
-    """
-    Renders the board with owner colours, banners, prices, and house indicators.
-
-    Internally uses the cached static layer (render_static_board) and
-    composites dynamic elements on top (render_dynamic_overlay).
-    The static layer is rebuilt only when ownership/mortgage state changes.
-    """
-    static_img = render_static_board(game)
-    return render_dynamic_overlay(static_img, game)
-
-
-def draw_player_tokens_on_image(base_img: Image.Image, game, positions_override: dict[int, int] | None = None) -> Image.Image:
-    """Draws multi-layer glowing player tokens on the pre-rendered board image."""
+def draw_player_tokens(base_img: Image.Image, game, positions_override: dict[int, int] | None = None) -> Image.Image:
+    """Draws multi-layer glowing neon player tokens on the board."""
     W, H = base_img.size
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    font_tiny = get_font(max(8, int(W * 0.009)), bold=False)
+    font_token = get_font(13, bold=True)
 
     pos_players: dict[int, list[int]] = {}
     for idx, player in enumerate(game.player_list):
-        state = game.get_player_state(player.id)
-        if not state.get("bankrupt", False):
-            if positions_override and player.id in positions_override:
-                p = positions_override[player.id]
-            else:
-                p = state["position"]
-            pos_players.setdefault(p, []).append(idx)
+        st = game.get_player_state(player.id)
+        if not st.get("is_eliminated", False):
+            p_pos = positions_override[player.id] if (positions_override and player.id in positions_override) else st["position"]
+            pos_players.setdefault(p_pos, []).append(idx)
 
     for pos, player_indices in pos_players.items():
-        x1, y1, x2, y2 = get_tile_bounds(pos, W, H)
+        x1, y1, x2, y2 = get_tile_rect(pos, W, H)
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
         count = len(player_indices)
 
         for i, p_idx in enumerate(player_indices):
-            offset_x = int((i - (count - 1) / 2) * (W * 0.022))
+            offset_x = int((i - (count - 1) / 2) * (W * 0.026))
             tx = center_x + offset_x
-            ty = center_y + int(H * 0.015) if pos not in (0, 10, 20, 30) else center_y
+            ty = center_y + (16 if pos not in (0, 5, 10, 15) else 0)
 
             scheme = PLAYER_NEON_SCHEMES[p_idx % len(PLAYER_NEON_SCHEMES)]
             r, g, b = scheme["rgb"]
 
-            # Layer 1: Translucent Glowing Aura
-            r_aura = int(W * 0.018)
-            draw.ellipse([tx - r_aura, ty - r_aura, tx + r_aura, ty + r_aura], fill=(r, g, b, 70))
+            # Glowing Aura
+            r_aura = int(W * 0.020)
+            draw.ellipse([tx - r_aura, ty - r_aura, tx + r_aura, ty + r_aura], fill=(r, g, b, 75))
 
-            # Layer 2: Secondary Bloom Ring
-            r_bloom = int(W * 0.014)
-            draw.ellipse([tx - r_bloom, ty - r_bloom, tx + r_bloom, ty + r_bloom], fill=(r, g, b, 140))
-
-            # Layer 3: Crisp Outer White Ring
-            r_ring = int(W * 0.011)
+            # Outer white crisp ring
+            r_ring = int(W * 0.014)
             draw.ellipse([tx - r_ring, ty - r_ring, tx + r_ring, ty + r_ring], outline=(255, 255, 255, 255), width=2)
 
-            # Layer 4: Solid Neon Core
-            r_core = int(W * 0.009)
+            # Solid neon core
+            r_core = int(W * 0.012)
             draw.ellipse([tx - r_core, ty - r_core, tx + r_core, ty + r_core], fill=(r, g, b, 240))
 
-            # Layer 5: Centered Player Label
-            draw.text((tx, ty), scheme["label"], fill=(255, 255, 255, 255), font=font_tiny, anchor="mm")
+            # Label (P1, P2, etc.)
+            draw.text((tx, ty), scheme["label"], fill=(0, 0, 0, 255), font=font_token, anchor="mm")
 
     return Image.alpha_composite(base_img, overlay).convert("RGB")
 
 
-def render_board_image(game, positions_override: dict[int, int] | None = None) -> io.BytesIO:
-    """Renders a static single PNG frame of the board."""
-    base_img = render_board_base(game)
-    final_img = draw_player_tokens_on_image(base_img, game, positions_override)
+# ---------------------------------------------------------------------------
+# Public Renderer API
+# ---------------------------------------------------------------------------
+def _render_board_image_sync(game, positions_override: dict[int, int] | None = None) -> io.BytesIO:
+    """Synchronous board rendering implementation."""
+    static_img = render_static_board(game)
+    dynamic_img = render_dynamic_overlay(static_img, game)
+    final_img = draw_player_tokens(dynamic_img, game, positions_override)
 
     buf = io.BytesIO()
     final_img.save(buf, format="PNG", optimize=True)
@@ -427,38 +469,35 @@ def render_board_image(game, positions_override: dict[int, int] | None = None) -
     return buf
 
 
-def render_board_movement_animation(game, moving_player_id: int, start_pos: int, end_pos: int) -> io.BytesIO:
-    """
-    Renders an animated GIF showing the token sliding tile-by-tile from start_pos to end_pos.
-    Intermediate frames have short durations and the final frame pauses.
-    The static board layer is reused across all frames for efficiency.
-    """
-    # Calculate stepping path along the 40-tile perimeter track
+async def render_board_image_async(game, positions_override: dict[int, int] | None = None) -> io.BytesIO:
+    """Asynchronously renders the board using run_in_executor to avoid blocking."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _render_board_image_sync, game, positions_override)
+
+
+def _render_board_animation_sync(game, moving_player_id: int, start_pos: int, end_pos: int) -> io.BytesIO:
+    """Synchronous animation rendering."""
     if start_pos == end_pos:
         path = [start_pos]
     elif end_pos > start_pos:
         path = list(range(start_pos, end_pos + 1))
     else:
-        # Wrapped around GO
-        path = list(range(start_pos, 40)) + list(range(0, end_pos + 1))
+        path = list(range(start_pos, 20)) + list(range(0, end_pos + 1))
 
     if len(path) <= 1:
-        return render_board_image(game)
+        return _render_board_image_sync(game)
 
-    # Render the dynamic base (ownership tints etc.) once and reuse across frames
-    base_img = render_board_base(game)
+    static_img = render_static_board(game)
+    dynamic_base = render_dynamic_overlay(static_img, game)
     frames = []
 
     for step_pos in path:
-        frame_img = draw_player_tokens_on_image(base_img, game, {moving_player_id: step_pos})
-        # Resize slightly to keep animated GIF compact & super snappy in Discord chat
-        frame_img = frame_img.resize((960, 768), Image.Resampling.BILINEAR)
-        # Convert to P mode with adaptive palette for crisp GIF color compression
-        frames.append(frame_img.convert("P", palette=Image.Palette.ADAPTIVE))
+        frame = draw_player_tokens(dynamic_base, game, {moving_player_id: step_pos})
+        # Resize for smooth Discord rendering
+        frame = frame.resize((960, 960), Image.Resampling.BILINEAR)
+        frames.append(frame.convert("P", palette=Image.Palette.ADAPTIVE))
 
-    # Intermediate steps ~190ms, resting frame ~1300ms
-    durations = [190] * (len(frames) - 1) + [1300]
-
+    durations = [220] * (len(frames) - 1) + [1400]
     buf = io.BytesIO()
     frames[0].save(
         buf,
@@ -471,3 +510,9 @@ def render_board_movement_animation(game, moving_player_id: int, start_pos: int,
     )
     buf.seek(0)
     return buf
+
+
+async def render_board_animation_async(game, moving_player_id: int, start_pos: int, end_pos: int) -> io.BytesIO:
+    """Asynchronously renders movement animation using run_in_executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _render_board_animation_sync, game, moving_player_id, start_pos, end_pos)
